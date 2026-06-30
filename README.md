@@ -9,6 +9,7 @@ This is not a face recognition app. It does not identify, compare, label, classi
 - Local Tkinter desktop UI.
 - OpenCV YuNet primary face detector.
 - Multi-scale detection passes.
+- Adaptive CLAHE, low-light gamma correction, denoising, and sharpening detection passes.
 - Overlapping 2x2 and 3x3 tiled detection for difficult images.
 - IoU non-maximum suppression to merge duplicate detections.
 - Expanded anonymization boxes to cover forehead, chin, ears, and face edges.
@@ -63,11 +64,11 @@ Supported input extensions are `jpg`, `jpeg`, `png`, `bmp`, `tif`, `tiff`, and `
 
 ## Privacy Notes
 
-- Images with no detected faces are stored under `Quarantine` in the output folder for manual review, rather than being mixed with anonymized results.
+- Images with no detected faces after all detection passes are isolated under `Quarantine`, rather than being mixed with anonymized results.
 
 - The app runs locally.
 - It makes no network requests during image processing.
-- It never places a zero-detection image in the normal anonymized output tree; those images are isolated under `Quarantine` for manual review.
+- It never places a zero-detection image in the normal anonymized output tree; those images are isolated under `Quarantine` as a fail-safe.
 - Output files are newly encoded with OpenCV, which strips source EXIF/metadata.
 - The optional deletion step happens only when every valid image file was processed and written successfully, and only after a final confirmation dialog.
 - If `send2trash` happens to be installed, deletion moves the input folder to the recycle bin. Otherwise Python permanently deletes the folder with `shutil.rmtree`.
@@ -77,12 +78,13 @@ Supported input extensions are `jpg`, `jpeg`, `png`, `bmp`, `tif`, `tiff`, and `
 
 Detection settings are configurable in `yunet_detector.py`:
 
-- `SCORE_THRESHOLD = 0.60`
+- `SCORE_THRESHOLD = 0.45`
 - `NMS_THRESHOLD = 0.30`
 - `TOP_K = 5000`
 - `SCALES = (1.0, 1.5, 2.0, 0.75, 0.5)`
 - `MAX_DETECTION_SIDE = 1800`
 - `TILE_OVERLAP = 0.20`
-- `ENABLE_ROTATED_PASSES = False`
+- `ENHANCED_SCALES = (1.0, 1.5, 2.0)`
+- `ENABLE_ROTATED_PASSES = True`
 
-Rotated passes are disabled by default for speed. Enable them in code if your image set commonly contains sideways or upside-down images.
+Enhancements are detection-only; anonymization is still applied to the original-resolution image. Normal-image passes always run, while extra low-light and restoration variants are selected from measured brightness, contrast, and sharpness.

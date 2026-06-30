@@ -213,7 +213,7 @@ class FaceAnonymizerApp:
             self.processed += 1
             if quarantined:
                 self.quarantined += 1
-                self._append_log("No face detected; saved to Quarantine for manual review.")
+                self._append_log("No face detected after all passes; isolated in Quarantine.")
             self.progress.configure(value=self.processed + self.failed)
             self.status_text.set(
                 f"Processed: {self.processed} | Quarantined: {self.quarantined} | "

@@ -8,13 +8,18 @@ import numpy as np
 from anonymizer import Box, clamp_box
 
 
-SCORE_THRESHOLD = 0.60
+SCORE_THRESHOLD = 0.45
 NMS_THRESHOLD = 0.30
 TOP_K = 5000
 SCALES = (1.0, 1.5, 2.0, 0.75, 0.5)
 MAX_DETECTION_SIDE = 1800
 TILE_OVERLAP = 0.20
-ENABLE_ROTATED_PASSES = False
+ENHANCED_SCALES = (1.0, 1.5, 2.0)
+ENHANCEMENT_MAX_SIDE = 1800
+ENABLE_ROTATED_PASSES = True
+LOW_LIGHT_MEAN = 105.0
+LOW_CONTRAST_STDDEV = 42.0
+SOFT_IMAGE_LAPLACIAN_VARIANCE = 115.0
 
 
 class YuNetFaceDetector:
@@ -48,12 +53,19 @@ class YuNetFaceDetector:
         for scale in SCALES:
             candidates.extend(self._detect_scaled(image, scale, 0, 0))
 
+        # Enhanced views recover evidence lost to darkness, flat contrast,
+        # sensor noise, compression, and mild focus blur. The original passes
+        # above remain authoritative for normal, well-exposed photographs.
+        candidates.extend(self._detect_enhanced_views(image))
+
         # Overlapping tiles improve small/difficult faces without forcing the
         # entire image through YuNet at a huge resolution.
         candidates.extend(self._detect_tiles(image, rows=2, cols=2))
         if max(width, height) >= 1800:
             candidates.extend(self._detect_tiles(image, rows=3, cols=3))
 
+        # Mixed-orientation group photos can contain both upright and sideways
+        # faces, so rotated views must not depend on the upright result count.
         if ENABLE_ROTATED_PASSES:
             candidates.extend(self._detect_rotated(image))
 
@@ -61,6 +73,22 @@ class YuNetFaceDetector:
         candidates.extend(self._detect_scaled(image, 1.0, 0, 0))
         clamped = [box for box in (clamp_box(b, width, height) for b in candidates) if box]
         return nms(clamped, NMS_THRESHOLD)
+
+    def _detect_enhanced_views(self, image: np.ndarray) -> list[Box]:
+        prepared, coordinate_scale = _bounded_copy(image, ENHANCEMENT_MAX_SIDE)
+        variants = _enhancement_variants(prepared)
+        boxes: list[Box] = []
+
+        for variant in variants:
+            for scale in ENHANCED_SCALES:
+                detected = self._detect_scaled(variant, scale, 0, 0)
+                boxes.extend(_rescale_boxes(detected, coordinate_scale))
+
+            # One tiled enhanced pass gives small degraded faces more pixels
+            # without repeating the full original-image tile pyramid.
+            tiled = self._detect_tiles(variant, rows=2, cols=2)
+            boxes.extend(_rescale_boxes(tiled, coordinate_scale))
+        return boxes
 
     def _detect_scaled(self, image: np.ndarray, requested_scale: float, x_offset: int, y_offset: int) -> list[Box]:
         height, width = image.shape[:2]
@@ -151,6 +179,69 @@ def _box_from_rotated(box: Box, original_w: int, original_h: int, angle: int) ->
     nx2 = max(p[0] for p in points)
     ny2 = max(p[1] for p in points)
     return Box(nx1, ny1, nx2 - nx1, ny2 - ny1, box.score)
+
+
+def _bounded_copy(image: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    height, width = image.shape[:2]
+    scale = min(1.0, max_side / max(width, height))
+    if scale >= 0.999:
+        return image, 1.0
+    size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    return cv2.resize(image, size, interpolation=cv2.INTER_AREA), scale
+
+
+def _enhancement_variants(image: np.ndarray) -> list[np.ndarray]:
+    """Build a small adaptive set of detection-only image enhancements."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mean, stddev = cv2.meanStdDev(gray)
+    brightness = float(mean[0, 0])
+    contrast = float(stddev[0, 0])
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    variants: list[np.ndarray] = []
+
+    # Local luminance contrast is useful across normal, backlit, and unevenly
+    # illuminated scenes while preserving color information expected by YuNet.
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    lightness, a_channel, b_channel = cv2.split(lab)
+    clip_limit = 3.0 if contrast < LOW_CONTRAST_STDDEV else 2.0
+    lightness = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8)).apply(lightness)
+    variants.append(cv2.cvtColor(cv2.merge((lightness, a_channel, b_channel)), cv2.COLOR_LAB2BGR))
+
+    if brightness < LOW_LIGHT_MEAN:
+        # Gamma below one lifts shadow detail without flattening highlights.
+        gamma = float(np.clip(0.48 + brightness / 500.0, 0.48, 0.68))
+        lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
+        lifted = cv2.LUT(image, lut)
+        lifted_lab = cv2.cvtColor(lifted, cv2.COLOR_BGR2LAB)
+        lifted_l, lifted_a, lifted_b = cv2.split(lifted_lab)
+        lifted_l = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(lifted_l)
+        variants.append(cv2.cvtColor(cv2.merge((lifted_l, lifted_a, lifted_b)), cv2.COLOR_LAB2BGR))
+
+    if sharpness < SOFT_IMAGE_LAPLACIAN_VARIANCE or contrast < LOW_CONTRAST_STDDEV:
+        # Gentle denoising before unsharp masking avoids magnifying block and
+        # sensor noise in low-quality files.
+        denoised = cv2.bilateralFilter(image, 7, 35, 35)
+        smooth = cv2.GaussianBlur(denoised, (0, 0), 1.2)
+        restored = cv2.addWeighted(denoised, 1.65, smooth, -0.65, 0)
+        variants.append(restored)
+
+    return variants
+
+
+def _rescale_boxes(boxes: list[Box], coordinate_scale: float) -> list[Box]:
+    if coordinate_scale >= 0.999:
+        return boxes
+    inverse = 1.0 / coordinate_scale
+    return [
+        Box(
+            int(round(box.x * inverse)),
+            int(round(box.y * inverse)),
+            int(round(box.w * inverse)),
+            int(round(box.h * inverse)),
+            box.score,
+        )
+        for box in boxes
+    ]
 
 
 def nms(boxes: list[Box], threshold: float) -> list[Box]:

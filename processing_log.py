@@ -39,7 +39,7 @@ class ProcessingLog:
                 f"OK: {source}",
                 f"  Output: {destination}",
                 f"  Faces detected: {faces}",
-                f"  Quarantined for manual review: {quarantined}",
+                f"  Quarantined after zero detections: {quarantined}",
             ]
         )
 
