@@ -63,9 +63,11 @@ Supported input extensions are `jpg`, `jpeg`, `png`, `bmp`, `tif`, `tiff`, and `
 
 ## Privacy Notes
 
+- Images with no detected faces are stored under `Quarantine` in the output folder for manual review, rather than being mixed with anonymized results.
+
 - The app runs locally.
 - It makes no network requests during image processing.
-- It never saves unprocessed originals to the output folder.
+- It never places a zero-detection image in the normal anonymized output tree; those images are isolated under `Quarantine` for manual review.
 - Output files are newly encoded with OpenCV, which strips source EXIF/metadata.
 - The optional deletion step happens only when every valid image file was processed and written successfully, and only after a final confirmation dialog.
 - If `send2trash` happens to be installed, deletion moves the input folder to the recycle bin. Otherwise Python permanently deletes the folder with `shutil.rmtree`.

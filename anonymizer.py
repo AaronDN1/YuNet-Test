@@ -56,12 +56,15 @@ def anonymize_faces(image: np.ndarray, boxes: list[Box], mode: str) -> np.ndarra
             continue
 
         if mode == MODE_BLUR:
-            output[y : y + h, x : x + w] = _strong_blur(roi)
+            effect = _strong_blur(roi)
+            result = _rounded_composite(roi, effect)
         elif mode == MODE_PIXELATE:
-            output[y : y + h, x : x + w] = _pixelate(roi)
+            result = _pixelate(roi)
         else:
             average = roi.reshape(-1, 3).mean(axis=0)
-            output[y : y + h, x : x + w] = average.astype(np.uint8)
+            result = np.full_like(roi, average.astype(np.uint8))
+
+        output[y : y + h, x : x + w] = result
 
     return output
 
@@ -70,8 +73,36 @@ def _strong_blur(roi: np.ndarray) -> np.ndarray:
     h, w = roi.shape[:2]
     kernel = max(31, (min(w, h) // 2) | 1)
     blurred = cv2.GaussianBlur(roi, (kernel, kernel), 0)
-    # A second pass makes the blur deliberately privacy-first, not cosmetic.
-    return cv2.GaussianBlur(blurred, (kernel, kernel), 0)
+    strong = cv2.GaussianBlur(blurred, (kernel, kernel), 0)
+
+    # Blend toward the strongest blur at the center for a smoother visual finish.
+    yy, xx = np.ogrid[-1.0:1.0:complex(h), -1.0:1.0:complex(w)]
+    center_weight = np.clip(1.0 - np.sqrt(xx * xx + yy * yy), 0.0, 1.0)
+    center_weight = (0.45 + 0.55 * center_weight)[..., None]
+    return np.clip(blurred * (1.0 - center_weight) + strong * center_weight, 0, 255).astype(np.uint8)
+
+
+def _rounded_composite(original: np.ndarray, effect: np.ndarray) -> np.ndarray:
+    """Apply an effect through a rounded mask with a subtle graduated edge."""
+    h, w = original.shape[:2]
+    radius = min(max(4, int(min(w, h) * 0.10)), max(1, (min(w, h) - 1) // 2))
+    feather = max(2, int(min(w, h) * 0.035))
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.rectangle(mask, (radius, 0), (w - radius - 1, h - 1), 255, -1)
+    cv2.rectangle(mask, (0, radius), (w - 1, h - radius - 1), 255, -1)
+    for center in (
+        (radius, radius),
+        (w - radius - 1, radius),
+        (radius, h - radius - 1),
+        (w - radius - 1, h - radius - 1),
+    ):
+        cv2.circle(mask, center, radius, 255, -1)
+
+    kernel = feather * 2 + 1
+    mask = cv2.GaussianBlur(mask, (kernel, kernel), 0)
+    alpha = (mask.astype(np.float32) / 255.0)[..., None]
+    return np.clip(effect * alpha + original * (1.0 - alpha), 0, 255).astype(np.uint8)
 
 
 def _pixelate(roi: np.ndarray) -> np.ndarray:

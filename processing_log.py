@@ -11,6 +11,7 @@ class ProcessingLog:
         self.path = output_dir / f"face_anonymization_log_{timestamp}.txt"
         self._failed: list[tuple[str, str]] = []
         self._processed = 0
+        self._quarantined = 0
         self._write(
             [
                 "Local Face Anonymization Log",
@@ -29,9 +30,18 @@ class ProcessingLog:
     def processed_count(self) -> int:
         return self._processed
 
-    def record_success(self, source: Path, destination: Path, faces: int) -> None:
+    def record_success(self, source: Path, destination: Path, faces: int, quarantined: bool = False) -> None:
         self._processed += 1
-        self._write([f"OK: {source}", f"  Output: {destination}", f"  Faces detected: {faces}"])
+        if quarantined:
+            self._quarantined += 1
+        self._write(
+            [
+                f"OK: {source}",
+                f"  Output: {destination}",
+                f"  Faces detected: {faces}",
+                f"  Quarantined for manual review: {quarantined}",
+            ]
+        )
 
     def record_failure(self, source: Path, error: str) -> None:
         self._failed.append((str(source), error))
@@ -42,6 +52,7 @@ class ProcessingLog:
             "",
             f"End time: {datetime.now().isoformat(timespec='seconds')}",
             f"Files processed: {self._processed}",
+            f"Files quarantined (no face detected): {self._quarantined}",
             f"Failed files: {len(self._failed)}",
             f"Input deletion performed: {deletion_performed}",
         ]
