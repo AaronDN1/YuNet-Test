@@ -25,6 +25,10 @@ SECOND_MODEL_FILENAMES = (
     "centerface.onnx",
 )
 SECOND_MODEL_GLOBS = ("centerface*.onnx",)
+YOLOX_MODEL_FILENAMES = (
+    "yoloxs_face.onnx",
+)
+YOLOX_MODEL_GLOBS = ("yolox*face*.onnx", "yolox*.onnx")
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,7 @@ class JobConfig:
     output_dir: Path
     model_path: Path
     second_model_path: Path | None
+    yolox_model_path: Path | None
     recursive: bool
     delete_after_success: bool
     mode: str
@@ -130,6 +135,7 @@ class FaceAnonymizerApp:
         output_dir = Path(self.output_dir.get()).resolve()
         model_path = _find_yunet_model()
         second_model_path = _find_second_model()
+        yolox_model_path = _find_yolox_model()
 
         if input_dir == output_dir:
             messagebox.showerror("Unsafe folder choice", "Input and output folders must be different.")
@@ -154,6 +160,7 @@ class FaceAnonymizerApp:
             output_dir=output_dir,
             model_path=model_path,
             second_model_path=second_model_path,
+            yolox_model_path=yolox_model_path,
             recursive=self.recursive.get(),
             delete_after_success=self.delete_after_success.get(),
             mode=self.mode.get(),
@@ -320,18 +327,50 @@ def _find_second_model() -> Path | None:
     return None
 
 
+def _find_yolox_model() -> Path | None:
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    for filename in YOLOX_MODEL_FILENAMES:
+        candidate = MODELS_DIR / filename
+        if candidate.exists():
+            return candidate
+    for pattern in YOLOX_MODEL_GLOBS:
+        for candidate in sorted(MODELS_DIR.glob(pattern)):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def _build_detector(config: JobConfig):
     """Build the ensemble when the second model is present, else fall back to YuNet.
 
     A missing or unloadable second model degrades to YuNet-only detection with a
-    logged note instead of failing the entire batch.
+    logged note instead of failing the entire batch. YOLOX is an optional third
+    voter; if its model or onnxruntime is missing, the ensemble runs without it.
     """
     if config.second_model_path is not None:
         try:
             from ensemble_detector import EnsembleFaceDetector
 
+            yolox_path = config.yolox_model_path
+            note = f"Detector: YuNet + CenterFace ensemble (second model: {config.second_model_path.name})."
+            if yolox_path is not None:
+                try:
+                    detector = EnsembleFaceDetector(
+                        config.model_path, config.second_model_path, yolox_path
+                    )
+                    return detector, (
+                        "Detector: YuNet + CenterFace + YOLOX-face ensemble "
+                        f"(second: {config.second_model_path.name}, yolox: {yolox_path.name})."
+                    )
+                except Exception as exc:
+                    detector = EnsembleFaceDetector(config.model_path, config.second_model_path)
+                    return detector, (
+                        f"YOLOX voter unavailable ({exc}). {note} "
+                        "Install onnxruntime to enable YOLOX."
+                    )
+
             detector = EnsembleFaceDetector(config.model_path, config.second_model_path)
-            return detector, f"Detector: YuNet + CenterFace ensemble (second model: {config.second_model_path.name})."
+            return detector, note
         except Exception as exc:
             return (
                 YuNetFaceDetector(config.model_path),

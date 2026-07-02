@@ -2,9 +2,14 @@
 
 CenterFace is an anchor-free CenterNet-style face detector. Its weights are
 MIT-licensed (Star-Clouds/CenterFace), so they are safe for commercial use and
-can ship with this repository. The model runs via ``cv2.dnn`` (no onnxruntime
-needed); OpenCV re-infers layer shapes, so the fixed-shape ONNX export still
-accepts arbitrary input sizes that are multiples of 32.
+can ship with this repository.
+
+IMPORTANT: this model is exported with a fixed ONNX input shape. OpenCV's DNN
+engine will run it at other sizes, but it retains internal shape state between
+forward passes -- if you run one image at a large size and the next at a smaller
+size, the second decode returns garbage. To stay correct across a batch of
+mixed-size images we always run at a single FIXED letterboxed input size, so the
+network shape never changes between calls.
 
 As with the YuNet proposer, this detector returns candidates down to a low score
 on purpose: precision comes later from cross-model agreement in the ensemble.
@@ -22,9 +27,8 @@ from boxops import nms
 
 SCORE_THRESHOLD = 0.35
 NMS_THRESHOLD = 0.30
-MAX_SIDE = 1600
-TILE_TRIGGER_SIDE = 1100
-TILE_OVERLAP = 0.20
+# Fixed square input (multiple of 32). Larger = better small-face recall, slower.
+INPUT_SIZE = 768
 STRIDE = 4
 OUTPUT_NAMES = ("537", "538", "539", "540")  # heatmap, scale, offset, landmarks
 
@@ -35,7 +39,8 @@ class CenterFaceDetector:
         model_path: Path,
         score_threshold: float = SCORE_THRESHOLD,
         nms_threshold: float = NMS_THRESHOLD,
-        max_side: int = MAX_SIDE,
+        input_size: int = INPUT_SIZE,
+        max_side: int | None = None,  # accepted for API compatibility; unused
     ) -> None:
         if not model_path.exists():
             raise FileNotFoundError(f"CenterFace model not found: {model_path}")
@@ -43,7 +48,7 @@ class CenterFaceDetector:
         self.net = cv2.dnn.readNetFromONNX(str(model_path))
         self.score_threshold = score_threshold
         self.nms_threshold = nms_threshold
-        self.max_side = max_side
+        self.input_size = max(32, int(round(input_size / 32) * 32))
 
     def detect(self, image: np.ndarray) -> list[Box]:
         return self._detect_scaled(image, 0, 0)
@@ -51,18 +56,16 @@ class CenterFaceDetector:
     def detect_candidates(self, image: np.ndarray) -> list[Box]:
         height, width = image.shape[:2]
         boxes = self._detect_scaled(image, 0, 0)
-
-        if max(width, height) >= TILE_TRIGGER_SIDE:
-            boxes.extend(self._detect_tiles(image, rows=2, cols=2))
-
+        if max(width, height) >= self.input_size:
+            boxes.extend(self.detect_tiles(image, rows=2, cols=2))
         return nms(boxes, self.nms_threshold)
 
-    def _detect_tiles(self, image: np.ndarray, rows: int, cols: int) -> list[Box]:
+    def detect_tiles(self, image: np.ndarray, rows: int, cols: int) -> list[Box]:
         height, width = image.shape[:2]
         tile_w = width / cols
         tile_h = height / rows
-        overlap_x = tile_w * TILE_OVERLAP
-        overlap_y = tile_h * TILE_OVERLAP
+        overlap_x = tile_w * 0.20
+        overlap_y = tile_h * 0.20
         boxes: list[Box] = []
 
         for row in range(rows):
@@ -82,29 +85,29 @@ class CenterFaceDetector:
         if width < 8 or height < 8:
             return []
 
-        cap = min(1.0, self.max_side / max(width, height))
-        net_w = max(32, int(np.ceil(width * cap / 32) * 32))
-        net_h = max(32, int(np.ceil(height * cap / 32) * 32))
+        # Letterbox into a fixed square so the net input shape never changes.
+        size = self.input_size
+        ratio = min(size / height, size / width)
+        new_w, new_h = int(round(width * ratio)), int(round(height * ratio))
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        canvas = np.zeros((size, size, 3), dtype=np.uint8)
+        canvas[:new_h, :new_w] = resized
 
         blob = cv2.dnn.blobFromImage(
-            image, scalefactor=1.0, size=(net_w, net_h), mean=(0, 0, 0), swapRB=True, crop=False
+            canvas, scalefactor=1.0, size=(size, size), mean=(0, 0, 0), swapRB=True, crop=False
         )
         self.net.setInput(blob)
         heatmap, scale, offset, _ = self.net.forward(list(OUTPUT_NAMES))
-
-        scale_w = net_w / width
-        scale_h = net_h / height
-        return self._decode(heatmap, scale, offset, net_w, net_h, scale_w, scale_h, x_offset, y_offset)
+        return self._decode(heatmap, scale, offset, ratio, new_w, new_h, x_offset, y_offset)
 
     def _decode(
         self,
         heatmap: np.ndarray,
         scale: np.ndarray,
         offset: np.ndarray,
-        net_w: int,
-        net_h: int,
-        scale_w: float,
-        scale_h: float,
+        ratio: float,
+        content_w: int,
+        content_h: int,
         x_offset: int,
         y_offset: int,
     ) -> list[Box]:
@@ -117,23 +120,32 @@ class CenterFaceDetector:
             return []
 
         scores = heat[rows, cols]
-        box_h = np.exp(scale_h_map[rows, cols]) * STRIDE
-        box_w = np.exp(scale_w_map[rows, cols]) * STRIDE
+
+        # Guard against pathological inputs: cap candidate count and clamp the
+        # exponent so exp() can't overflow. Real faces are unaffected.
+        if rows.size > 2000:
+            top = np.argsort(scores)[::-1][:2000]
+            rows, cols, scores = rows[top], cols[top], scores[top]
+
+        box_h = np.exp(np.clip(scale_h_map[rows, cols], None, 6.0)) * STRIDE
+        box_w = np.exp(np.clip(scale_w_map[rows, cols], None, 6.0)) * STRIDE
         off_y = offset_y_map[rows, cols]
         off_x = offset_x_map[rows, cols]
 
-        x1 = (cols + off_x + 0.5) * STRIDE - box_w / 2
-        y1 = (rows + off_y + 0.5) * STRIDE - box_h / 2
-        x1 = np.clip(x1, 0, net_w)
-        y1 = np.clip(y1, 0, net_h)
+        # Center in the fixed letterboxed frame.
+        cx = (cols + off_x + 0.5) * STRIDE
+        cy = (rows + off_y + 0.5) * STRIDE
 
         result: list[Box] = []
-        for bx, by, bw, bh, score in zip(x1, y1, box_w, box_h, scores):
-            w = bw / scale_w
-            h = bh / scale_h
+        for cxi, cyi, bw, bh, score in zip(cx, cy, box_w, box_h, scores):
+            # Drop detections whose center falls in the padded (non-image) area.
+            if cxi > content_w or cyi > content_h:
+                continue
+            w = bw / ratio
+            h = bh / ratio
             if w <= 1 or h <= 1:
                 continue
-            result.append(
-                Box(int(round(bx / scale_w)) + x_offset, int(round(by / scale_h)) + y_offset, int(round(w)), int(round(h)), float(score))
-            )
+            x = (cxi - bw / 2) / ratio + x_offset
+            y = (cyi - bh / 2) / ratio + y_offset
+            result.append(Box(int(round(x)), int(round(y)), int(round(w)), int(round(h)), float(score)))
         return result

@@ -84,6 +84,14 @@ class YuNetFaceDetector:
         clamped = [box for box in (clamp_box(c.box, width, height) for c in candidates) if box]
         return nms(clamped, NMS_THRESHOLD)
 
+    def detect_simple(self, image: np.ndarray) -> list[Box]:
+        """Single YuNet pass (auto-capped resolution), for the lean ensemble."""
+        return self._detect_scaled(image, 1.0, 0, 0)
+
+    def detect_tiles(self, image: np.ndarray, rows: int, cols: int) -> list[Box]:
+        """Public tiled pass for the ensemble's small-face recovery."""
+        return self._detect_tiles(image, rows, cols)
+
     def gather_candidates(self, image: np.ndarray) -> list[DetectionCandidate]:
         height, width = image.shape[:2]
         candidates: list[DetectionCandidate] = []

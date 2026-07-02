@@ -7,17 +7,21 @@ This is not a face recognition app. It does not identify, compare, label, classi
 ## Features
 
 - Local Tkinter desktop UI.
-- Two-model detection ensemble: OpenCV YuNet plus CenterFace (both MIT-licensed,
-  both run through OpenCV; no extra inference runtime required).
+- Multi-model detection ensemble: OpenCV YuNet (MIT) + CenterFace (MIT) + an
+  optional YOLOX-face third voter (Apache-2.0, via onnxruntime). All weights are
+  commercial-safe.
 - Cross-model agreement for precision: weak detections are kept only when an
   independent model corroborates them, which reduces false positives on
-  low-quality/low-light images without lowering recall.
+  low-quality/low-light images without lowering recall. More independent voters
+  make agreement stronger.
 - Automatic fallback to YuNet-only if the CenterFace model is missing.
-- Multi-scale detection passes.
-- Adaptive CLAHE, low-light gamma correction, denoising, and sharpening detection passes (applied to both detectors).
-- Overlapping 2x2 and 3x3 tiled detection for difficult images.
+- Lean, fixed detection passes tuned for batch/CPU speed: one capped-resolution
+  pass per model, a low-light-enhanced pass only when the image is dark or flat,
+  and a 2x2 tiled pass only on large images for small faces.
+- Adaptive CLAHE + shadow-lifting gamma for low-light images (applied to both detectors).
 - IoU non-maximum suppression to merge duplicate detections.
 - Expanded anonymization boxes to cover forehead, chin, ears, and face edges.
+- `visualize_detections.py` tool to inspect and tune detection on your own images.
 - Three anonymization modes:
   - Solid average-color fill, the default and strongest privacy option.
   - Strong blur.
@@ -56,6 +60,11 @@ The model is published by OpenCV Zoo. If your downloaded file is named `face_det
 repository, so the YuNet + CenterFace ensemble runs automatically. If that file
 is missing, the app logs a note and continues with YuNet-only detection.
 
+6. A YOLOX-face model (`models/yoloxs_face.onnx`, Apache-2.0) also ships with the
+repository and is used as an optional third voter in the ensemble. It requires
+`onnxruntime` (in `requirements.txt`). If `onnxruntime` or the model file is
+missing, the app logs a note and runs the YuNet + CenterFace ensemble without it.
+
 ### Licensing note for commercial use
 
 Only use detector weights whose license permits commercial use. In particular,
@@ -63,8 +72,8 @@ Only use detector weights whose license permits commercial use. In particular,
 `det_10g.onnx`) are for non-commercial research only** and must not be used or
 redistributed in a commercial product. The InsightFace *code* is MIT, but the
 *weights* are not. Commercially usable, permissively licensed alternatives
-include OpenCV YuNet (MIT), CenterFace (MIT), and MediaPipe BlazeFace
-(Apache-2.0). This note is not legal advice.
+include OpenCV YuNet (MIT), CenterFace (MIT), YOLOX / YOLOX-face (Apache-2.0),
+and MediaPipe BlazeFace (Apache-2.0). This note is not legal advice.
 
 ## Run
 
@@ -106,15 +115,35 @@ YuNet pass settings are configurable in `yunet_detector.py`:
 - `ENHANCED_SCALES = (1.0, 1.5, 2.0)`
 - `ENABLE_ROTATED_PASSES = True`
 
-CenterFace settings are in `centerface_detector.py` (`SCORE_THRESHOLD`, `NMS_THRESHOLD`, `MAX_SIDE`, `TILE_TRIGGER_SIDE`).
+Detection runs a lean, fixed set of passes for speed: each model runs once on
+the resolution-capped frame, once more on a low-light-enhanced frame only when
+the image is dark or flat, and one 2x2 tiled pass only on large images to
+recover small faces. CenterFace settings are in `centerface_detector.py`
+(`SCORE_THRESHOLD`, `NMS_THRESHOLD`, `INPUT_SIZE`); it always runs at a fixed
+letterboxed input size for correctness across mixed-size batches. YOLOX settings
+are in `yolox_detector.py` (`SCORE_THRESHOLD`).
 
-The ensemble fusion knobs live in `ensemble_detector.py` and are how you tune the precision/recall balance:
+The ensemble knobs live in `ensemble_detector.py` and are how you tune the
+precision/recall balance and speed:
 
-- `SECOND_TRUST_THRESHOLD = 0.45` — accept CenterFace alone above this score.
-- `YUNET_TRUST_THRESHOLD = 0.88` — accept YuNet alone above this score.
-- `SECOND_MIN_FOR_AGREEMENT = 0.25` / `YUNET_MIN_FOR_AGREEMENT = 0.50` — minimum scores that can qualify for cross-model agreement.
+- `MAX_DETECTION_SIDE = 1600` — full-frame passes run at this cap. Lower is faster but misses small faces.
+- `TILE_TRIGGER_SIDE = 1600` — images at/above this also get a tiled pass.
+- `YOLOX_TILE_ENABLED = False` — enable to also tile YOLOX (better small-face recall, noticeably slower).
+- `CENTERFACE_TRUST = 0.45` / `YUNET_TRUST = 0.85` / `YOLOX_TRUST = 0.50` — accept a detection from one model alone above these scores.
+- `CENTERFACE_MIN = 0.20` / `YUNET_MIN = 0.40` / `YOLOX_MIN = 0.30` — weaker detections need corroboration from another model.
 - `AGREEMENT_IOU = 0.30` / `AGREEMENT_CONTAINMENT = 0.60` — overlap needed to count as agreement.
 
-To catch more faces (higher recall), lower `SECOND_TRUST_THRESHOLD` and the agreement minimums. To cut false positives (higher precision), raise the trust thresholds so more detections must be corroborated by both models.
+To catch more faces (higher recall), lower the trust thresholds and agreement minimums. To cut false positives (higher precision), raise the trust thresholds so more detections must be corroborated by another model.
+
+### Tuning on your own images
+
+Run the visualization tool to see exactly what each model proposes and what the
+ensemble accepts, then adjust the knobs above:
+
+```bash
+python visualize_detections.py path/to/input_folder
+```
+
+It writes annotated copies (green = accepted/blurred, blue = CenterFace, red = YuNet, with scores) plus a `_summary.txt`.
 
 Enhancements are detection-only; anonymization is still applied to the original-resolution image. Normal-image passes always run, while extra low-light and restoration variants are selected from measured brightness, contrast, and sharpness.

@@ -1,2 +1,5 @@
 opencv-python>=4.8.0
 numpy>=1.24.0
+# Optional: enables the YOLOX-face third voter. The app runs without it
+# (YuNet + CenterFace ensemble) if onnxruntime is not installed.
+onnxruntime>=1.16.0

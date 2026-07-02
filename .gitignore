@@ -14,6 +14,7 @@ face_anonymization_log_*.txt
 # Model weights: ignore by default. Never commit non-commercial weights
 # (e.g. InsightFace SCRFD/RetinaFace det_10g.onnx / buffalo_*).
 *.onnx
-# Exceptions: permissively licensed (MIT) weights we intentionally ship.
+# Exceptions: permissively licensed (MIT/Apache-2.0) weights we intentionally ship.
 !models/centerface.onnx
 !models/face_detection_yunet_2023mar.onnx
+!models/yoloxs_face.onnx
