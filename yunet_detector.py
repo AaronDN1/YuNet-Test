@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -11,6 +12,11 @@ from anonymizer import Box, clamp_box
 SCORE_THRESHOLD = 0.45
 NMS_THRESHOLD = 0.30
 TOP_K = 5000
+DIRECT_ACCEPT_THRESHOLD = 0.68
+ENHANCED_DIRECT_ACCEPT_THRESHOLD = 0.78
+CONSENSUS_ACCEPT_THRESHOLD = 0.48
+CONSENSUS_IOU = 0.22
+MIN_CONSENSUS_PASSES = 3
 SCALES = (1.0, 1.5, 2.0, 0.75, 0.5)
 MAX_DETECTION_SIDE = 1800
 TILE_OVERLAP = 0.20
@@ -20,6 +26,12 @@ ENABLE_ROTATED_PASSES = True
 LOW_LIGHT_MEAN = 105.0
 LOW_CONTRAST_STDDEV = 42.0
 SOFT_IMAGE_LAPLACIAN_VARIANCE = 115.0
+
+
+@dataclass(frozen=True)
+class DetectionCandidate:
+    box: Box
+    evidence: str
 
 
 class YuNetFaceDetector:
@@ -47,11 +59,11 @@ class YuNetFaceDetector:
 
     def detect(self, image: np.ndarray) -> list[Box]:
         height, width = image.shape[:2]
-        candidates: list[Box] = []
+        candidates: list[DetectionCandidate] = []
 
         # Full-frame multi-scale detection catches faces at very different sizes.
-        for scale in SCALES:
-            candidates.extend(self._detect_scaled(image, scale, 0, 0))
+        for index, scale in enumerate(SCALES):
+            candidates.extend(_tag(self._detect_scaled(image, scale, 0, 0), f"original-scale-{index}"))
 
         # Enhanced views recover evidence lost to darkness, flat contrast,
         # sensor noise, compression, and mild focus blur. The original passes
@@ -60,34 +72,42 @@ class YuNetFaceDetector:
 
         # Overlapping tiles improve small/difficult faces without forcing the
         # entire image through YuNet at a huge resolution.
-        candidates.extend(self._detect_tiles(image, rows=2, cols=2))
+        candidates.extend(_tag(self._detect_tiles(image, rows=2, cols=2), "original-tiles-2"))
         if max(width, height) >= 1800:
-            candidates.extend(self._detect_tiles(image, rows=3, cols=3))
+            candidates.extend(_tag(self._detect_tiles(image, rows=3, cols=3), "original-tiles-3"))
 
         # Mixed-orientation group photos can contain both upright and sideways
         # faces, so rotated views must not depend on the upright result count.
         if ENABLE_ROTATED_PASSES:
-            candidates.extend(self._detect_rotated(image))
+            candidates.extend(_tag(self._detect_rotated(image), "rotated"))
 
         # Final full-image pass after tiles catches faces that cross tile borders.
-        candidates.extend(self._detect_scaled(image, 1.0, 0, 0))
-        clamped = [box for box in (clamp_box(b, width, height) for b in candidates) if box]
+        candidates.extend(_tag(self._detect_scaled(image, 1.0, 0, 0), "original-final"))
+        accepted = _accept_supported_candidates(candidates)
+        clamped = [box for box in (clamp_box(b, width, height) for b in accepted) if box]
         return nms(clamped, NMS_THRESHOLD)
 
-    def _detect_enhanced_views(self, image: np.ndarray) -> list[Box]:
+    def _detect_enhanced_views(self, image: np.ndarray) -> list[DetectionCandidate]:
         prepared, coordinate_scale = _bounded_copy(image, ENHANCEMENT_MAX_SIDE)
         variants = _enhancement_variants(prepared)
-        boxes: list[Box] = []
+        boxes: list[DetectionCandidate] = []
 
-        for variant in variants:
-            for scale in ENHANCED_SCALES:
+        for variant_index, variant in enumerate(variants):
+            for scale_index, scale in enumerate(ENHANCED_SCALES):
                 detected = self._detect_scaled(variant, scale, 0, 0)
-                boxes.extend(_rescale_boxes(detected, coordinate_scale))
+                boxes.extend(
+                    _tag(
+                        _rescale_boxes(detected, coordinate_scale),
+                        f"enhanced-{variant_index}-scale-{scale_index}",
+                    )
+                )
 
             # One tiled enhanced pass gives small degraded faces more pixels
             # without repeating the full original-image tile pyramid.
             tiled = self._detect_tiles(variant, rows=2, cols=2)
-            boxes.extend(_rescale_boxes(tiled, coordinate_scale))
+            boxes.extend(
+                _tag(_rescale_boxes(tiled, coordinate_scale), f"enhanced-{variant_index}-tiles")
+            )
         return boxes
 
     def _detect_scaled(self, image: np.ndarray, requested_scale: float, x_offset: int, y_offset: int) -> list[Box]:
@@ -244,6 +264,38 @@ def _rescale_boxes(boxes: list[Box], coordinate_scale: float) -> list[Box]:
     ]
 
 
+def _tag(boxes: list[Box], evidence: str) -> list[DetectionCandidate]:
+    return [DetectionCandidate(box, evidence) for box in boxes]
+
+
+def _accept_supported_candidates(candidates: list[DetectionCandidate]) -> list[Box]:
+    """Keep strong detections and weak detections corroborated by other passes."""
+    accepted: list[Box] = []
+    for candidate in candidates:
+        box = candidate.box
+        direct_threshold = (
+            ENHANCED_DIRECT_ACCEPT_THRESHOLD
+            if candidate.evidence.startswith("enhanced-")
+            else DIRECT_ACCEPT_THRESHOLD
+        )
+        if box.score >= direct_threshold:
+            accepted.append(box)
+            continue
+        if box.score < CONSENSUS_ACCEPT_THRESHOLD:
+            continue
+
+        supporting_passes = {candidate.evidence}
+        for other in candidates:
+            if other.evidence == candidate.evidence:
+                continue
+            if _iou(box, other.box) >= CONSENSUS_IOU or _containment(box, other.box) >= 0.60:
+                supporting_passes.add(other.evidence)
+                if len(supporting_passes) >= MIN_CONSENSUS_PASSES:
+                    accepted.append(box)
+                    break
+    return accepted
+
+
 def nms(boxes: list[Box], threshold: float) -> list[Box]:
     if not boxes:
         return []
@@ -260,7 +312,7 @@ def nms(boxes: list[Box], threshold: float) -> list[Box]:
         for j in order:
             if j == i or j in suppressed:
                 continue
-            if _iou(current, boxes[j]) > threshold:
+            if _same_face(current, boxes[j], threshold):
                 suppressed.add(j)
     return keep
 
@@ -277,3 +329,24 @@ def _iou(a: Box, b: Box) -> float:
         return 0.0
     union = a.w * a.h + b.w * b.h - inter
     return inter / union if union else 0.0
+
+
+def _containment(a: Box, b: Box) -> float:
+    ax2, ay2 = a.x + a.w, a.y + a.h
+    bx2, by2 = b.x + b.w, b.y + b.h
+    inter_w = max(0, min(ax2, bx2) - max(a.x, b.x))
+    inter_h = max(0, min(ay2, by2) - max(a.y, b.y))
+    smaller_area = min(a.w * a.h, b.w * b.h)
+    return (inter_w * inter_h) / smaller_area if smaller_area else 0.0
+
+
+def _same_face(a: Box, b: Box, iou_threshold: float) -> bool:
+    if _iou(a, b) > iou_threshold or _containment(a, b) > 0.72:
+        return True
+
+    center_a = (a.x + a.w / 2.0, a.y + a.h / 2.0)
+    center_b = (b.x + b.w / 2.0, b.y + b.h / 2.0)
+    distance = float(np.hypot(center_a[0] - center_b[0], center_a[1] - center_b[1]))
+    scale = max(a.w, a.h, b.w, b.h)
+    area_ratio = max(a.w * a.h, b.w * b.h) / max(1, min(a.w * a.h, b.w * b.h))
+    return distance < scale * 0.28 and area_ratio < 3.0

@@ -12,6 +12,7 @@ This is not a face recognition app. It does not identify, compare, label, classi
 - Adaptive CLAHE, low-light gamma correction, denoising, and sharpening detection passes.
 - Overlapping 2x2 and 3x3 tiled detection for difficult images.
 - IoU non-maximum suppression to merge duplicate detections.
+- Cross-pass consensus filtering for low-confidence detections, plus containment-aware duplicate merging.
 - Expanded anonymization boxes to cover forehead, chin, ears, and face edges.
 - Three anonymization modes:
   - Solid average-color fill, the default and strongest privacy option.
@@ -79,6 +80,9 @@ Supported input extensions are `jpg`, `jpeg`, `png`, `bmp`, `tif`, `tiff`, and `
 Detection settings are configurable in `yunet_detector.py`:
 
 - `SCORE_THRESHOLD = 0.45`
+- `DIRECT_ACCEPT_THRESHOLD = 0.68`
+- `ENHANCED_DIRECT_ACCEPT_THRESHOLD = 0.78`
+- `MIN_CONSENSUS_PASSES = 3`
 - `NMS_THRESHOLD = 0.30`
 - `TOP_K = 5000`
 - `SCALES = (1.0, 1.5, 2.0, 0.75, 0.5)`
