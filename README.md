@@ -7,11 +7,12 @@ This is not a face recognition app. It does not identify, compare, label, classi
 ## Features
 
 - Local Tkinter desktop UI.
-- Two-model detection ensemble: OpenCV YuNet plus SCRFD (ONNX via onnxruntime).
+- Two-model detection ensemble: OpenCV YuNet plus CenterFace (both MIT-licensed,
+  both run through OpenCV; no extra inference runtime required).
 - Cross-model agreement for precision: weak detections are kept only when an
   independent model corroborates them, which reduces false positives on
   low-quality/low-light images without lowering recall.
-- Automatic fallback to YuNet-only if no SCRFD model or onnxruntime is present.
+- Automatic fallback to YuNet-only if the CenterFace model is missing.
 - Multi-scale detection passes.
 - Adaptive CLAHE, low-light gamma correction, denoising, and sharpening detection passes (applied to both detectors).
 - Overlapping 2x2 and 3x3 tiled detection for difficult images.
@@ -51,23 +52,19 @@ models/face_detection_yunet_2023mar.onnx
 
 The model is published by OpenCV Zoo. If your downloaded file is named `face_detection_yunet_2023.mar.onnx`, that filename is accepted too. If the file is missing, the app will show a clear startup error when processing begins.
 
-5. (Recommended) Add a SCRFD ONNX model to enable the detection ensemble. Place any of these filenames in the `models` folder (the app also matches any `scrfd*.onnx`):
-
-```text
-models/scrfd_10g_bnkps.onnx        (most accurate, slower)
-models/scrfd_2.5g_bnkps.onnx       (balanced)
-models/scrfd_500m_bnkps.onnx       (fastest)
-```
-
-If a SCRFD model is present, the app runs the YuNet + SCRFD ensemble automatically. If it is absent (or onnxruntime is not installed), the app logs a note and continues with YuNet-only detection.
+5. The CenterFace model (`models/centerface.onnx`, MIT-licensed) ships with this
+repository, so the YuNet + CenterFace ensemble runs automatically. If that file
+is missing, the app logs a note and continues with YuNet-only detection.
 
 ### Licensing note for commercial use
 
-The SCRFD *architecture/code* (InsightFace) is MIT-licensed, but the model
-**weights** hosted by InsightFace are published for non-commercial research use.
-For commercial deployment, ensure the specific `.onnx` weights file you ship is
-covered by a license that permits commercial use. This applies to the actual
-weights file, not just the source repository. This note is not legal advice.
+Only use detector weights whose license permits commercial use. In particular,
+**InsightFace's SCRFD/RetinaFace pretrained weights (including `buffalo_*` /
+`det_10g.onnx`) are for non-commercial research only** and must not be used or
+redistributed in a commercial product. The InsightFace *code* is MIT, but the
+*weights* are not. Commercially usable, permissively licensed alternatives
+include OpenCV YuNet (MIT), CenterFace (MIT), and MediaPipe BlazeFace
+(Apache-2.0). This note is not legal advice.
 
 ## Run
 
@@ -109,15 +106,15 @@ YuNet pass settings are configurable in `yunet_detector.py`:
 - `ENHANCED_SCALES = (1.0, 1.5, 2.0)`
 - `ENABLE_ROTATED_PASSES = True`
 
-SCRFD settings are in `scrfd_detector.py` (`SCORE_THRESHOLD`, `NMS_THRESHOLD`, `DEFAULT_INPUT_SIZE`, `TILE_TRIGGER_SIDE`).
+CenterFace settings are in `centerface_detector.py` (`SCORE_THRESHOLD`, `NMS_THRESHOLD`, `MAX_SIDE`, `TILE_TRIGGER_SIDE`).
 
 The ensemble fusion knobs live in `ensemble_detector.py` and are how you tune the precision/recall balance:
 
-- `SCRFD_TRUST_THRESHOLD = 0.50` — accept SCRFD alone above this score.
+- `SECOND_TRUST_THRESHOLD = 0.45` — accept CenterFace alone above this score.
 - `YUNET_TRUST_THRESHOLD = 0.88` — accept YuNet alone above this score.
-- `SCRFD_MIN_FOR_AGREEMENT = 0.30` / `YUNET_MIN_FOR_AGREEMENT = 0.50` — minimum scores that can qualify for cross-model agreement.
+- `SECOND_MIN_FOR_AGREEMENT = 0.25` / `YUNET_MIN_FOR_AGREEMENT = 0.50` — minimum scores that can qualify for cross-model agreement.
 - `AGREEMENT_IOU = 0.30` / `AGREEMENT_CONTAINMENT = 0.60` — overlap needed to count as agreement.
 
-To catch more faces (higher recall), lower `SCRFD_TRUST_THRESHOLD` and the agreement minimums. To cut false positives (higher precision), raise the trust thresholds so more detections must be corroborated by both models.
+To catch more faces (higher recall), lower `SECOND_TRUST_THRESHOLD` and the agreement minimums. To cut false positives (higher precision), raise the trust thresholds so more detections must be corroborated by both models.
 
 Enhancements are detection-only; anonymization is still applied to the original-resolution image. Normal-image passes always run, while extra low-light and restoration variants are selected from measured brightness, contrast, and sharpness.
