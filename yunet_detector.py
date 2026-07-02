@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from anonymizer import Box, clamp_box
+from boxops import containment, iou, nms
 
 
 SCORE_THRESHOLD = 0.45
@@ -58,6 +59,32 @@ class YuNetFaceDetector:
         )
 
     def detect(self, image: np.ndarray) -> list[Box]:
+        """YuNet-only detection using same-model cross-pass consensus.
+
+        Kept for the standalone fallback path when no second model is available.
+        The ensemble path uses ``detect_candidates`` instead and gets its
+        precision from an independent model rather than from correlated passes.
+        """
+        height, width = image.shape[:2]
+        candidates = self.gather_candidates(image)
+        accepted = _accept_supported_candidates(candidates)
+        clamped = [box for box in (clamp_box(b, width, height) for b in accepted) if box]
+        return nms(clamped, NMS_THRESHOLD)
+
+    def detect_candidates(self, image: np.ndarray) -> list[Box]:
+        """Return every merged detection with its score, without self-consensus.
+
+        This is the high-recall proposer feed for the ensemble. Precision is not
+        applied here on purpose: an independent model decides which of these
+        candidates to trust, which avoids YuNet's own biases voting for
+        themselves across correlated enhancement passes.
+        """
+        height, width = image.shape[:2]
+        candidates = self.gather_candidates(image)
+        clamped = [box for box in (clamp_box(c.box, width, height) for c in candidates) if box]
+        return nms(clamped, NMS_THRESHOLD)
+
+    def gather_candidates(self, image: np.ndarray) -> list[DetectionCandidate]:
         height, width = image.shape[:2]
         candidates: list[DetectionCandidate] = []
 
@@ -83,13 +110,11 @@ class YuNetFaceDetector:
 
         # Final full-image pass after tiles catches faces that cross tile borders.
         candidates.extend(_tag(self._detect_scaled(image, 1.0, 0, 0), "original-final"))
-        accepted = _accept_supported_candidates(candidates)
-        clamped = [box for box in (clamp_box(b, width, height) for b in accepted) if box]
-        return nms(clamped, NMS_THRESHOLD)
+        return candidates
 
     def _detect_enhanced_views(self, image: np.ndarray) -> list[DetectionCandidate]:
-        prepared, coordinate_scale = _bounded_copy(image, ENHANCEMENT_MAX_SIDE)
-        variants = _enhancement_variants(prepared)
+        prepared, coordinate_scale = bounded_copy(image, ENHANCEMENT_MAX_SIDE)
+        variants = enhancement_variants(prepared)
         boxes: list[DetectionCandidate] = []
 
         for variant_index, variant in enumerate(variants):
@@ -201,7 +226,7 @@ def _box_from_rotated(box: Box, original_w: int, original_h: int, angle: int) ->
     return Box(nx1, ny1, nx2 - nx1, ny2 - ny1, box.score)
 
 
-def _bounded_copy(image: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+def bounded_copy(image: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
     height, width = image.shape[:2]
     scale = min(1.0, max_side / max(width, height))
     if scale >= 0.999:
@@ -210,7 +235,7 @@ def _bounded_copy(image: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
     return cv2.resize(image, size, interpolation=cv2.INTER_AREA), scale
 
 
-def _enhancement_variants(image: np.ndarray) -> list[np.ndarray]:
+def enhancement_variants(image: np.ndarray) -> list[np.ndarray]:
     """Build a small adaptive set of detection-only image enhancements."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     mean, stddev = cv2.meanStdDev(gray)
@@ -288,65 +313,9 @@ def _accept_supported_candidates(candidates: list[DetectionCandidate]) -> list[B
         for other in candidates:
             if other.evidence == candidate.evidence:
                 continue
-            if _iou(box, other.box) >= CONSENSUS_IOU or _containment(box, other.box) >= 0.60:
+            if iou(box, other.box) >= CONSENSUS_IOU or containment(box, other.box) >= 0.60:
                 supporting_passes.add(other.evidence)
                 if len(supporting_passes) >= MIN_CONSENSUS_PASSES:
                     accepted.append(box)
                     break
     return accepted
-
-
-def nms(boxes: list[Box], threshold: float) -> list[Box]:
-    if not boxes:
-        return []
-
-    order = sorted(range(len(boxes)), key=lambda i: boxes[i].score, reverse=True)
-    keep: list[Box] = []
-    suppressed: set[int] = set()
-
-    for i in order:
-        if i in suppressed:
-            continue
-        current = boxes[i]
-        keep.append(current)
-        for j in order:
-            if j == i or j in suppressed:
-                continue
-            if _same_face(current, boxes[j], threshold):
-                suppressed.add(j)
-    return keep
-
-
-def _iou(a: Box, b: Box) -> float:
-    ax2, ay2 = a.x + a.w, a.y + a.h
-    bx2, by2 = b.x + b.w, b.y + b.h
-    x1 = max(a.x, b.x)
-    y1 = max(a.y, b.y)
-    x2 = min(ax2, bx2)
-    y2 = min(ay2, by2)
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    if inter == 0:
-        return 0.0
-    union = a.w * a.h + b.w * b.h - inter
-    return inter / union if union else 0.0
-
-
-def _containment(a: Box, b: Box) -> float:
-    ax2, ay2 = a.x + a.w, a.y + a.h
-    bx2, by2 = b.x + b.w, b.y + b.h
-    inter_w = max(0, min(ax2, bx2) - max(a.x, b.x))
-    inter_h = max(0, min(ay2, by2) - max(a.y, b.y))
-    smaller_area = min(a.w * a.h, b.w * b.h)
-    return (inter_w * inter_h) / smaller_area if smaller_area else 0.0
-
-
-def _same_face(a: Box, b: Box, iou_threshold: float) -> bool:
-    if _iou(a, b) > iou_threshold or _containment(a, b) > 0.72:
-        return True
-
-    center_a = (a.x + a.w / 2.0, a.y + a.h / 2.0)
-    center_b = (b.x + b.w / 2.0, b.y + b.h / 2.0)
-    distance = float(np.hypot(center_a[0] - center_b[0], center_a[1] - center_b[1]))
-    scale = max(a.w, a.h, b.w, b.h)
-    area_ratio = max(a.w * a.h, b.w * b.h) / max(1, min(a.w * a.h, b.w * b.h))
-    return distance < scale * 0.28 and area_ratio < 3.0

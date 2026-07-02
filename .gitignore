@@ -1,0 +1,16 @@
+# Model weights are large and may carry non-commercial licenses.
+# Fetch them locally instead (see get_scrfd_model.py / README).
+models/
+*.onnx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# App/runtime artifacts
+smoke_result.txt
+Quarantine/
+face_anonymization_log_*.txt

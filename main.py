@@ -21,6 +21,19 @@ MODEL_FILENAMES = (
     "face_detection_yunet_2023mar.onnx",
     "face_detection_yunet_2023.mar.onnx",
 )
+SCRFD_MODEL_FILENAMES = (
+    "scrfd_10g_bnkps.onnx",
+    "scrfd_10g.onnx",
+    "scrfd_2.5g_bnkps.onnx",
+    "scrfd_2.5g.onnx",
+    "scrfd_500m_bnkps.onnx",
+    "scrfd_500m.onnx",
+    "scrfd.onnx",
+    "det_10g.onnx",
+    "det_2.5g.onnx",
+    "det_500m.onnx",
+)
+SCRFD_MODEL_GLOBS = ("scrfd*.onnx", "det_*.onnx")
 
 
 @dataclass(frozen=True)
@@ -28,6 +41,7 @@ class JobConfig:
     input_dir: Path
     output_dir: Path
     model_path: Path
+    scrfd_model_path: Path | None
     recursive: bool
     delete_after_success: bool
     mode: str
@@ -124,6 +138,7 @@ class FaceAnonymizerApp:
         input_dir = Path(self.input_dir.get()).resolve()
         output_dir = Path(self.output_dir.get()).resolve()
         model_path = _find_yunet_model()
+        scrfd_model_path = _find_scrfd_model()
 
         if input_dir == output_dir:
             messagebox.showerror("Unsafe folder choice", "Input and output folders must be different.")
@@ -147,6 +162,7 @@ class FaceAnonymizerApp:
             input_dir=input_dir,
             output_dir=output_dir,
             model_path=model_path,
+            scrfd_model_path=scrfd_model_path,
             recursive=self.recursive.get(),
             delete_after_success=self.delete_after_success.get(),
             mode=self.mode.get(),
@@ -164,7 +180,8 @@ class FaceAnonymizerApp:
             files = iter_image_files(config.input_dir, config.recursive)
             self.events.put(("total", len(files)))
             log = ProcessingLog(config.output_dir, config.input_dir)
-            detector = YuNetFaceDetector(config.model_path)
+            detector, detector_note = _build_detector(config)
+            self.events.put(("note", detector_note))
 
             for index, source in enumerate(files, start=1):
                 self.events.put(("file", f"[{index}/{len(files)}] {source}"))
@@ -207,6 +224,8 @@ class FaceAnonymizerApp:
             self._append_log(f"Found {self.total_files} image file(s).")
         elif event == "file":
             self.status_text.set(str(payload))
+            self._append_log(str(payload))
+        elif event == "note":
             self._append_log(str(payload))
         elif event == "success":
             faces, quarantined = payload  # type: ignore[misc]
@@ -295,6 +314,42 @@ def _find_yunet_model() -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def _find_scrfd_model() -> Path | None:
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    for filename in SCRFD_MODEL_FILENAMES:
+        candidate = MODELS_DIR / filename
+        if candidate.exists():
+            return candidate
+    for pattern in SCRFD_MODEL_GLOBS:
+        for candidate in sorted(MODELS_DIR.glob(pattern)):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _build_detector(config: JobConfig):
+    """Build the ensemble when a SCRFD model is present, else fall back to YuNet.
+
+    A missing model file or missing onnxruntime degrades to YuNet-only detection
+    with a logged note instead of failing the entire batch.
+    """
+    if config.scrfd_model_path is not None:
+        try:
+            from ensemble_detector import EnsembleFaceDetector
+
+            detector = EnsembleFaceDetector(config.model_path, config.scrfd_model_path)
+            return detector, f"Detector: YuNet + SCRFD ensemble (SCRFD model: {config.scrfd_model_path.name})."
+        except Exception as exc:
+            return (
+                YuNetFaceDetector(config.model_path),
+                f"SCRFD ensemble unavailable ({exc}). Falling back to YuNet-only detection.",
+            )
+    return (
+        YuNetFaceDetector(config.model_path),
+        "Detector: YuNet-only. Add a SCRFD .onnx model to the models folder to enable the ensemble.",
+    )
 
 
 if __name__ == "__main__":
