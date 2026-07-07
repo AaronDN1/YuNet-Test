@@ -340,6 +340,46 @@ def _find_yolox_model() -> Path | None:
     return None
 
 
+def build_ensemble_detector(
+    model_path: Path,
+    second_model_path: Path | None = None,
+    yolox_model_path: Path | None = None,
+):
+    """Build the ensemble with the same YOLOX fallback used by the main app."""
+    if second_model_path is not None:
+        try:
+            from ensemble_detector import EnsembleFaceDetector
+
+            note = f"Detector: YuNet + CenterFace ensemble (second model: {second_model_path.name})."
+            if yolox_model_path is not None:
+                try:
+                    detector = EnsembleFaceDetector(
+                        model_path, second_model_path, yolox_model_path
+                    )
+                    return detector, (
+                        "Detector: YuNet + CenterFace + YOLOX-face ensemble "
+                        f"(second: {second_model_path.name}, yolox: {yolox_model_path.name})."
+                    )
+                except Exception as exc:
+                    detector = EnsembleFaceDetector(model_path, second_model_path)
+                    return detector, (
+                        f"YOLOX voter unavailable ({exc}). {note} "
+                        "Install onnxruntime to enable YOLOX."
+                    )
+
+            detector = EnsembleFaceDetector(model_path, second_model_path)
+            return detector, note
+        except Exception as exc:
+            return (
+                YuNetFaceDetector(model_path),
+                f"CenterFace ensemble unavailable ({exc}). Falling back to YuNet-only detection.",
+            )
+    return (
+        YuNetFaceDetector(model_path),
+        "Detector: YuNet-only. Add models/centerface.onnx to enable the ensemble.",
+    )
+
+
 def _build_detector(config: JobConfig):
     """Build the ensemble when the second model is present, else fall back to YuNet.
 
@@ -347,38 +387,8 @@ def _build_detector(config: JobConfig):
     logged note instead of failing the entire batch. YOLOX is an optional third
     voter; if its model or onnxruntime is missing, the ensemble runs without it.
     """
-    if config.second_model_path is not None:
-        try:
-            from ensemble_detector import EnsembleFaceDetector
-
-            yolox_path = config.yolox_model_path
-            note = f"Detector: YuNet + CenterFace ensemble (second model: {config.second_model_path.name})."
-            if yolox_path is not None:
-                try:
-                    detector = EnsembleFaceDetector(
-                        config.model_path, config.second_model_path, yolox_path
-                    )
-                    return detector, (
-                        "Detector: YuNet + CenterFace + YOLOX-face ensemble "
-                        f"(second: {config.second_model_path.name}, yolox: {yolox_path.name})."
-                    )
-                except Exception as exc:
-                    detector = EnsembleFaceDetector(config.model_path, config.second_model_path)
-                    return detector, (
-                        f"YOLOX voter unavailable ({exc}). {note} "
-                        "Install onnxruntime to enable YOLOX."
-                    )
-
-            detector = EnsembleFaceDetector(config.model_path, config.second_model_path)
-            return detector, note
-        except Exception as exc:
-            return (
-                YuNetFaceDetector(config.model_path),
-                f"CenterFace ensemble unavailable ({exc}). Falling back to YuNet-only detection.",
-            )
-    return (
-        YuNetFaceDetector(config.model_path),
-        "Detector: YuNet-only. Add models/centerface.onnx to enable the ensemble.",
+    return build_ensemble_detector(
+        config.model_path, config.second_model_path, config.yolox_model_path
     )
 
 

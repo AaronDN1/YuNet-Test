@@ -10,9 +10,8 @@ import sys
 import time
 from pathlib import Path
 
-from ensemble_detector import EnsembleFaceDetector
 from image_io import load_image
-from main import _find_second_model, _find_yolox_model, _find_yunet_model
+from main import _find_second_model, _find_yolox_model, _find_yunet_model, build_ensemble_detector
 
 
 def main() -> int:
@@ -32,7 +31,8 @@ def main() -> int:
         return 1
 
     yolox_path = _find_yolox_model()
-    detector = EnsembleFaceDetector(yunet_path, second_path, yolox_path)
+    detector, note = build_ensemble_detector(yunet_path, second_path, yolox_path)
+    print(note)
 
     image = load_image(source)
     t0 = time.perf_counter()
@@ -41,7 +41,7 @@ def main() -> int:
 
     faces = len(result["faces"])
     print(f"image: {source.name} ({image.shape[1]}x{image.shape[0]})")
-    print(f"yolox_enabled: {yolox_path is not None}")
+    print(f"yolox_enabled: {getattr(detector, 'yolox', None) is not None}")
     print(f"faces_accepted: {faces}")
     print(f"clahe_retry: {result.get('retry_used', False)}")
     print(f"salvage_pass: {result.get('salvage_used', False)}")

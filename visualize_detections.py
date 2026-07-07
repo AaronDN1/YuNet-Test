@@ -24,9 +24,8 @@ from pathlib import Path
 
 import cv2
 
-from ensemble_detector import EnsembleFaceDetector
 from image_io import iter_image_files, load_image
-from main import _find_second_model, _find_yolox_model, _find_yunet_model
+from main import _find_second_model, _find_yolox_model, _find_yunet_model, build_ensemble_detector
 
 
 def _draw(image, boxes, color, thickness, label_scores):
@@ -54,7 +53,10 @@ def main() -> int:
     output_dir = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else input_dir.parent / f"{input_dir.name}_annotated"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    detector = EnsembleFaceDetector(_find_yunet_model(), _find_second_model(), _find_yolox_model())
+    detector, note = build_ensemble_detector(
+        _find_yunet_model(), _find_second_model(), _find_yolox_model()
+    )
+    print(note)
     files = iter_image_files(input_dir, recursive=True)
     print(f"Annotating {len(files)} image(s) -> {output_dir}")
 
