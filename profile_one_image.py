@@ -1,4 +1,4 @@
-"""Print per-stage detection timings for one image.
+"""Print detection timing and retry/salvage flags for one image.
 
 Usage:
     python profile_one_image.py path/to/image.jpg
@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from ensemble_detector import ENABLE_YOLOX_VOTER, EnsembleFaceDetector
+from ensemble_detector import EnsembleFaceDetector
 from image_io import load_image
 from main import _find_second_model, _find_yolox_model, _find_yunet_model
 
@@ -31,7 +31,7 @@ def main() -> int:
         print("Missing YuNet or CenterFace model in models/.")
         return 1
 
-    yolox_path = _find_yolox_model() if ENABLE_YOLOX_VOTER else None
+    yolox_path = _find_yolox_model()
     detector = EnsembleFaceDetector(yunet_path, second_path, yolox_path)
 
     image = load_image(source)
@@ -39,18 +39,15 @@ def main() -> int:
     result = detector.detect_debug(image)
     total_ms = (time.perf_counter() - t0) * 1000.0
 
-    stage = int(result["escalation_stage"])
     faces = len(result["faces"])
     print(f"image: {source.name} ({image.shape[1]}x{image.shape[0]})")
-    print(f"yolox_enabled: {ENABLE_YOLOX_VOTER and yolox_path is not None}")
-    print(f"escalation_stage: {stage}")
+    print(f"yolox_enabled: {yolox_path is not None}")
     print(f"faces_accepted: {faces}")
-    print("stage_timings_ms:")
-    for name, ms in result.get("stage_timings_ms", {}).items():
-        print(f"  {name}: {ms:.1f} ms")
+    print(f"clahe_retry: {result.get('retry_used', False)}")
+    print(f"salvage_pass: {result.get('salvage_used', False)}")
     print(f"total: {total_ms:.1f} ms")
     if faces:
-        print(f"-> accepted at stage {stage} ({'fast exit' if stage == 0 else 'escalated'})")
+        print("-> faces accepted")
     else:
         print("-> quarantine (no faces accepted)")
     return 0

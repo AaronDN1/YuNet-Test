@@ -7,18 +7,19 @@ This is not a face recognition app. It does not identify, compare, label, classi
 ## Features
 
 - Local Tkinter desktop UI.
-- Multi-model detection ensemble: OpenCV YuNet (MIT) + CenterFace (MIT), with an
+- Multi-model detection ensemble: OpenCV YuNet (MIT) + CenterFace (MIT) + an
   optional YOLOX-face third voter (Apache-2.0, via onnxruntime). All weights are
-  commercial-safe. YOLOX is **off by default** for speed.
+  commercial-safe.
 - Cross-model agreement for precision: weak detections are kept only when an
   independent model corroborates them, which reduces false positives on
   low-quality/low-light images without lowering recall. More independent voters
   make agreement stronger.
 - Automatic fallback to YuNet-only if the CenterFace model is missing.
-- **Escalation ladder** for speed on clear photos and targeted recall on hard
-  images: CenterFace-only fast exit when confident, YuNet corroboration only when
-  needed, one enhanced pass for low-quality misses, and 2x2 tiling only as a last
-  resort on large images.
+- Lean, fixed detection passes tuned for batch/CPU speed: one capped-resolution
+  pass per model, a low-light-enhanced pass only when the image is dark or flat,
+  and a 2x2 tiled pass only on large images for small faces.
+- Zero-face salvage pass: if an image would quarantine, one alternate-enhancement
+  retry runs automatically (no extra user step).
 - Adaptive CLAHE + shadow-lifting gamma for low-light images (applied to both detectors).
 - IoU non-maximum suppression to merge duplicate detections.
 - Expanded anonymization boxes to cover forehead, chin, ears, and face edges.
@@ -61,10 +62,10 @@ The model is published by OpenCV Zoo. If your downloaded file is named `face_det
 repository, so the YuNet + CenterFace ensemble runs automatically. If that file
 is missing, the app logs a note and continues with YuNet-only detection.
 
-6. A YOLOX-face model (`models/yoloxs_face.onnx`, Apache-2.0) ships with the
-repository but is **not used by default**. Set `ENABLE_YOLOX_VOTER = True` in
-`ensemble_detector.py` to load it as an optional third voter (requires
-`onnxruntime` in `requirements.txt`).
+6. A YOLOX-face model (`models/yoloxs_face.onnx`, Apache-2.0) also ships with the
+repository and is used as an optional third voter in the ensemble. It requires
+`onnxruntime` (in `requirements.txt`). If `onnxruntime` or the model file is
+missing, the app logs a note and runs the YuNet + CenterFace ensemble without it.
 
 ### Licensing note for commercial use
 
@@ -105,20 +106,6 @@ Supported input extensions are `jpg`, `jpeg`, `png`, `bmp`, `tif`, `tiff`, and `
 
 ## Detection Defaults
 
-The ensemble uses a **CenterFace-first escalation ladder** in
-`ensemble_detector.py`:
-
-| Stage | When | What runs |
-|-------|------|-----------|
-| **0** | Always | CenterFace on capped frame; **fast exit** if any box ≥ `CENTERFACE_TRUST` |
-| **1** | No stage-0 exit | YuNet (+ optional YOLOX) on base frame; fuse with CenterFace |
-| **2** | Still zero faces | One enhanced view (low-light or CLAHE); CenterFace + YuNet |
-| **3** | Still zero, large image | 2×2 tiles for CenterFace + YuNet only |
-
-Clear photos typically finish at **stage 0** (~one CenterFace pass). Low-quality
-quarantine misses get stage 2 enhancement; large difficult images may reach
-stage 3 tiles.
-
 YuNet pass settings are configurable in `yunet_detector.py`:
 
 - `SCORE_THRESHOLD = 0.45`
@@ -130,8 +117,10 @@ YuNet pass settings are configurable in `yunet_detector.py`:
 - `ENHANCED_SCALES = (1.0, 1.5, 2.0)`
 - `ENABLE_ROTATED_PASSES = True`
 
-Detection runs the escalation ladder above instead of running every model on
-every view. CenterFace settings are in `centerface_detector.py`
+Detection runs a lean, fixed set of passes for speed: each model runs once on
+the resolution-capped frame, once more on a low-light-enhanced frame only when
+the image is dark or flat, and one 2x2 tiled pass only on large images to
+recover small faces. CenterFace settings are in `centerface_detector.py`
 (`SCORE_THRESHOLD`, `NMS_THRESHOLD`, `INPUT_SIZE`); it always runs at a fixed
 letterboxed input size for correctness across mixed-size batches. YOLOX settings
 are in `yolox_detector.py` (`SCORE_THRESHOLD`).
@@ -139,10 +128,11 @@ are in `yolox_detector.py` (`SCORE_THRESHOLD`).
 The ensemble knobs live in `ensemble_detector.py` and are how you tune the
 precision/recall balance and speed:
 
-- `ENABLE_YOLOX_VOTER = False` — set `True` to load YOLOX as a third voter (slower).
 - `MAX_DETECTION_SIDE = 1600` — full-frame passes run at this cap. Lower is faster but misses small faces.
-- `TILE_TRIGGER_SIDE = 1600` — images at/above this may get a tiled pass in stage 3 only.
-- `ESCALATION_CENTERFACE_SCORE = 0.28` — lower proposal threshold for CenterFace in stages 2–3 only.
+- `TILE_TRIGGER_SIDE = 1600` — images at/above this also get a tiled pass.
+- `YOLOX_TILE_ENABLED = False` — enable to also tile YOLOX (better small-face recall, noticeably slower).
+- `ZERO_FACE_CLAHE_RETRY = True` — if the lean path finds nothing and the image skipped the low-light pass, run one cheap CLAHE retry with the same fusion rules.
+- `ZERO_FACE_SALVAGE_PASS = True` — if still zero faces, one alternate-enhancement pass with a lower CenterFace proposal threshold on salvage only (`SALVAGE_CENTERFACE_SCORE = 0.28`). Fusion trust rules stay unchanged.
 - `CENTERFACE_TRUST = 0.45` / `YUNET_TRUST = 0.85` / `YOLOX_TRUST = 0.50` — accept a detection from one model alone above these scores.
 - `CENTERFACE_MIN = 0.20` / `YUNET_MIN = 0.40` / `YOLOX_MIN = 0.30` — weaker detections need corroboration from another model.
 - `AGREEMENT_IOU = 0.30` / `AGREEMENT_CONTAINMENT = 0.60` — overlap needed to count as agreement.
@@ -158,12 +148,6 @@ ensemble accepts, then adjust the knobs above:
 python visualize_detections.py path/to/input_folder
 ```
 
-It writes annotated copies (green = accepted/blurred, blue = CenterFace, red = YuNet, with scores) plus a `_summary.txt` showing `stage=0|1|2|3` per image.
+It writes annotated copies (green = accepted/blurred, blue = CenterFace, red = YuNet, with scores) plus a `_summary.txt`.
 
-To profile per-stage timings on a single image:
-
-```bash
-python profile_one_image.py path/to/image.jpg
-```
-
-Enhancements are detection-only; anonymization is still applied to the original-resolution image.
+Enhancements are detection-only; anonymization is still applied to the original-resolution image. Normal-image passes always run, while extra low-light, CLAHE retry, and salvage variants run only when needed.

@@ -24,7 +24,7 @@ from pathlib import Path
 
 import cv2
 
-from ensemble_detector import ENABLE_YOLOX_VOTER, EnsembleFaceDetector
+from ensemble_detector import EnsembleFaceDetector
 from image_io import iter_image_files, load_image
 from main import _find_second_model, _find_yolox_model, _find_yunet_model
 
@@ -54,8 +54,7 @@ def main() -> int:
     output_dir = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else input_dir.parent / f"{input_dir.name}_annotated"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    yolox_path = _find_yolox_model() if ENABLE_YOLOX_VOTER else None
-    detector = EnsembleFaceDetector(_find_yunet_model(), _find_second_model(), yolox_path)
+    detector = EnsembleFaceDetector(_find_yunet_model(), _find_second_model(), _find_yolox_model())
     files = iter_image_files(input_dir, recursive=True)
     print(f"Annotating {len(files)} image(s) -> {output_dir}")
 
@@ -79,7 +78,8 @@ def main() -> int:
                 f"accepted={len(result['faces'])} "
                 f"centerface={len(result['centerface'])} yunet={len(result['yunet'])} "
                 f"yolox={len(result.get('yolox', []))} "
-                f"stage={result.get('escalation_stage', '?')}"
+                f"retry={'yes' if result.get('retry_used') else 'no'} "
+                f"salvage={'yes' if result.get('salvage_used') else 'no'}"
             )
             print(line)
             summary.append(line)

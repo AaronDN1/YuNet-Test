@@ -135,9 +135,7 @@ class FaceAnonymizerApp:
         output_dir = Path(self.output_dir.get()).resolve()
         model_path = _find_yunet_model()
         second_model_path = _find_second_model()
-        from ensemble_detector import ENABLE_YOLOX_VOTER
-
-        yolox_model_path = _find_yolox_model() if ENABLE_YOLOX_VOTER else None
+        yolox_model_path = _find_yolox_model()
 
         if input_dir == output_dir:
             messagebox.showerror("Unsafe folder choice", "Input and output folders must be different.")
@@ -351,9 +349,9 @@ def _build_detector(config: JobConfig):
     """
     if config.second_model_path is not None:
         try:
-            from ensemble_detector import ENABLE_YOLOX_VOTER, EnsembleFaceDetector
+            from ensemble_detector import EnsembleFaceDetector
 
-            yolox_path = config.yolox_model_path if ENABLE_YOLOX_VOTER else None
+            yolox_path = config.yolox_model_path
             note = f"Detector: YuNet + CenterFace ensemble (second model: {config.second_model_path.name})."
             if yolox_path is not None:
                 try:
@@ -362,8 +360,7 @@ def _build_detector(config: JobConfig):
                     )
                     return detector, (
                         "Detector: YuNet + CenterFace + YOLOX-face ensemble "
-                        f"(second: {config.second_model_path.name}, yolox: {yolox_path.name}). "
-                        "Set ENABLE_YOLOX_VOTER = False in ensemble_detector.py to disable."
+                        f"(second: {config.second_model_path.name}, yolox: {yolox_path.name})."
                     )
                 except Exception as exc:
                     detector = EnsembleFaceDetector(config.model_path, config.second_model_path)
