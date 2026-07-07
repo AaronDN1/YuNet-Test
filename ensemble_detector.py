@@ -1,23 +1,17 @@
-"""Lean multi-model face detection ensemble.
+"""Lean multi-model face detection ensemble with a CenterFace-first escalation ladder.
 
-Design goals: fast and accurate on batch/CPU.
+Stage 0: CenterFace base pass only. Confident faces return immediately.
+Stage 1: Add YuNet (and optional YOLOX) on the base frame; fuse.
+Stage 2: One enhanced view (low-light or CLAHE); CenterFace + YuNet (+ YOLOX).
+Stage 3: 2x2 tiles on large images when earlier stages found nothing.
 
-Stage 1 (recall): each detector (YuNet, CenterFace, and optionally YOLOX-face)
-runs a small, fixed number of passes -- a base pass, one low-light-enhanced pass
-only when the image is dark/flat, and one tiled pass only on large images for
-small faces. Everything runs at a single capped resolution, computed once.
-
-Stage 2 (precision): cross-model agreement. A detection is kept if it is
-confident on its own OR corroborated by another architecturally independent
-model. A medium-confidence face seen by only one model is still recoverable
-through agreement rather than silently dropped, which matters for a privacy tool
-where a missed face is a leak. More independent voters make agreement stronger.
-
-All bundled models are MIT/Apache-2.0 and safe for commercial use.
+Normal clear photos pay ~one CenterFace pass. Low-quality quarantine cases get
+targeted escalation without running every model on every view.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,24 +23,18 @@ from boxops import containment, iou, nms
 from centerface_detector import CenterFaceDetector
 from yunet_detector import NMS_THRESHOLD, YuNetFaceDetector, bounded_copy
 
-# One capped resolution for all passes keeps cost predictable and bounded.
 MAX_DETECTION_SIDE = 1600
 TILE_TRIGGER_SIDE = 1600
 
-# YOLOX is fixed-640 and heavy; tiling it is accurate but slow. Off by default.
-YOLOX_TILE_ENABLED = False
+# YOLOX is heavy; off by default. Set True to load yoloxs_face.onnx as a voter.
+ENABLE_YOLOX_VOTER = False
 
-# Only spend a second detection pass on enhancement when the image needs it.
 LOW_LIGHT_MEAN = 110.0
 LOW_CONTRAST_STDDEV = 48.0
 
-# If the lean path still finds nothing, and the image was bright/flat enough that
-# we skipped the low-light pass, try one cheap CLAHE contrast boost. This targets
-# noisy JPEG-style misses without the heavy recovery path from before.
-ZERO_FACE_CLAHE_RETRY = True
+# Lower proposal threshold for CenterFace during escalation only (fusion unchanged).
+ESCALATION_CENTERFACE_SCORE = 0.28
 
-# Per-model thresholds: accept alone above `trust`; below it (but above `min`)
-# only with corroboration from another model.
 CENTERFACE_TRUST, CENTERFACE_MIN = 0.45, 0.20
 YUNET_TRUST, YUNET_MIN = 0.85, 0.40
 YOLOX_TRUST, YOLOX_MIN = 0.50, 0.30
@@ -73,7 +61,7 @@ class EnsembleFaceDetector:
         self.yunet = YuNetFaceDetector(yunet_model_path)
         self.second = CenterFaceDetector(second_model_path, max_side=MAX_DETECTION_SIDE)
         self.yolox = None
-        if yolox_model_path is not None:
+        if yolox_model_path is not None and ENABLE_YOLOX_VOTER:
             from yolox_detector import YoloxFaceDetector
 
             self.yolox = YoloxFaceDetector(yolox_model_path)
@@ -81,88 +69,158 @@ class EnsembleFaceDetector:
     def detect(self, image: np.ndarray) -> list[Box]:
         return self.detect_debug(image)["faces"]
 
-    def detect_debug(self, image: np.ndarray) -> dict[str, list[Box]]:
-        """Run detection and also return each model's raw boxes.
-
-        The extra fields let the visualization tool show what each model proposed
-        versus what the ensemble accepted, which is how you diagnose misses
-        (recall) and false blurs (precision) on real images.
-        """
+    def detect_debug(self, image: np.ndarray) -> dict[str, object]:
         height, width = image.shape[:2]
-
-        # Cap resolution once; run every pass in this space, map back at the end.
         work, scale = bounded_copy(image, MAX_DETECTION_SIDE)
         large = max(work.shape[:2]) >= TILE_TRIGGER_SIDE
-
-        views = [work]
-        if _needs_low_light(work):
-            views.append(_enhance_low_light(work))
 
         second_boxes: list[Box] = []
         yunet_boxes: list[Box] = []
         yolox_boxes: list[Box] = []
-        for view in views:
-            second_boxes.extend(self.second.detect(view))
-            yunet_boxes.extend(self.yunet.detect_simple(view))
-            if self.yolox is not None:
-                yolox_boxes.extend(self.yolox.detect(view))
+        escalation_stage = 0
+        stage_timings: dict[str, float] = {}
 
-        # Large images: one tiled pass recovers small faces missed when the whole
-        # frame is downscaled.
-        if large:
-            second_boxes.extend(self.second.detect_tiles(work, rows=2, cols=2))
-            yunet_boxes.extend(self.yunet.detect_tiles(work, rows=2, cols=2))
-            if self.yolox is not None and YOLOX_TILE_ENABLED:
-                yolox_boxes.extend(self.yolox.detect_tiles(work, rows=2, cols=2))
-
-        retry_used = False
-        accepted, second_boxes, yunet_boxes, yolox_boxes = self._finalize(
-            second_boxes, yunet_boxes, yolox_boxes, scale
-        )
-
-        # Noisy but adequately bright/flat images skip the low-light pass. If they
-        # would quarantine, one CLAHE retry is cheap and uses the same fusion rules.
-        if ZERO_FACE_CLAHE_RETRY and not accepted and len(views) == 1:
-            retry_used = True
-            clahe_view = _enhance_clahe(work)
-            second_boxes.extend(self.second.detect(clahe_view))
-            yunet_boxes.extend(self.yunet.detect_simple(clahe_view))
-            if self.yolox is not None:
-                yolox_boxes.extend(self.yolox.detect(clahe_view))
-            accepted, second_boxes, yunet_boxes, yolox_boxes = self._finalize(
-                second_boxes, yunet_boxes, yolox_boxes, scale
+        # Stage 0: CenterFace only — fast exit when clearly confident.
+        t0 = time.perf_counter()
+        second_boxes.extend(self.second.detect(work))
+        stage_timings["stage0_centerface"] = (time.perf_counter() - t0) * 1000.0
+        confident = [b for b in second_boxes if b.score >= CENTERFACE_TRUST]
+        if confident:
+            faces = self._output(confident, width, height, scale)
+            return self._debug_result(
+                faces,
+                second_boxes,
+                yunet_boxes,
+                yolox_boxes,
+                scale,
+                escalation_stage,
+                stage_timings,
             )
 
-        clamped = [box for box in (clamp_box(b, width, height) for b in accepted) if box]
-        faces = nms(clamped, NMS_THRESHOLD)
-        return {
-            "faces": faces,
-            "centerface": second_boxes,
-            "yunet": yunet_boxes,
-            "yolox": yolox_boxes,
-            "retry_used": retry_used,
-        }
+        # Stage 1: corroborate with YuNet (+ optional YOLOX) on the base frame.
+        escalation_stage = 1
+        t0 = time.perf_counter()
+        yunet_boxes.extend(self.yunet.detect_simple(work))
+        if self.yolox is not None:
+            yolox_boxes.extend(self.yolox.detect(work))
+        stage_timings["stage1_yunet_yolox"] = (time.perf_counter() - t0) * 1000.0
 
-    def _finalize(
+        accepted = self._fuse_groups(second_boxes, yunet_boxes, yolox_boxes, scale)
+        if accepted:
+            faces = self._output(accepted, width, height, scale)
+            return self._debug_result(
+                faces,
+                second_boxes,
+                yunet_boxes,
+                yolox_boxes,
+                scale,
+                escalation_stage,
+                stage_timings,
+            )
+
+        # Stage 2: one enhanced view for low-quality / noisy misses.
+        escalation_stage = 2
+        t0 = time.perf_counter()
+        enhanced = (
+            _enhance_low_light(work) if _needs_low_light(work) else _enhance_clahe(work)
+        )
+        second_boxes.extend(
+            self.second.detect(enhanced, score_threshold=ESCALATION_CENTERFACE_SCORE)
+        )
+        yunet_boxes.extend(self.yunet.detect_simple(enhanced))
+        if self.yolox is not None:
+            yolox_boxes.extend(self.yolox.detect(enhanced))
+        stage_timings["stage2_enhanced"] = (time.perf_counter() - t0) * 1000.0
+
+        accepted = self._fuse_groups(second_boxes, yunet_boxes, yolox_boxes, scale)
+        if accepted:
+            faces = self._output(accepted, width, height, scale)
+            return self._debug_result(
+                faces,
+                second_boxes,
+                yunet_boxes,
+                yolox_boxes,
+                scale,
+                escalation_stage,
+                stage_timings,
+            )
+
+        # Stage 3: tiled last resort on large images only.
+        if large:
+            escalation_stage = 3
+            t0 = time.perf_counter()
+            second_boxes.extend(
+                self.second.detect_tiles(
+                    work, rows=2, cols=2, score_threshold=ESCALATION_CENTERFACE_SCORE
+                )
+            )
+            yunet_boxes.extend(self.yunet.detect_tiles(work, rows=2, cols=2))
+            if self.yolox is not None:
+                yolox_boxes.extend(self.yolox.detect_tiles(work, rows=2, cols=2))
+            stage_timings["stage3_tiles"] = (time.perf_counter() - t0) * 1000.0
+
+            accepted = self._fuse_groups(second_boxes, yunet_boxes, yolox_boxes, scale)
+            if accepted:
+                faces = self._output(accepted, width, height, scale)
+                return self._debug_result(
+                    faces,
+                    second_boxes,
+                    yunet_boxes,
+                    yolox_boxes,
+                    scale,
+                    escalation_stage,
+                    stage_timings,
+                )
+
+        faces = self._output([], width, height, scale)
+        return self._debug_result(
+            faces, second_boxes, yunet_boxes, yolox_boxes, scale, escalation_stage, stage_timings
+        )
+
+    def _fuse_groups(
         self,
         second_boxes: list[Box],
         yunet_boxes: list[Box],
         yolox_boxes: list[Box],
         scale: float,
-    ) -> tuple[list[Box], list[Box], list[Box], list[Box]]:
-        second_boxes = nms(_rescale_boxes(second_boxes, scale), self.second.nms_threshold)
-        yunet_boxes = nms(_rescale_boxes(yunet_boxes, scale), NMS_THRESHOLD)
-
+    ) -> list[Box]:
+        second = nms(_rescale_boxes(second_boxes, scale), self.second.nms_threshold)
+        yunet = nms(_rescale_boxes(yunet_boxes, scale), NMS_THRESHOLD)
         groups = [
-            _ModelGroup("centerface", second_boxes, CENTERFACE_TRUST, CENTERFACE_MIN),
-            _ModelGroup("yunet", yunet_boxes, YUNET_TRUST, YUNET_MIN),
+            _ModelGroup("centerface", second, CENTERFACE_TRUST, CENTERFACE_MIN),
+            _ModelGroup("yunet", yunet, YUNET_TRUST, YUNET_MIN),
         ]
         if self.yolox is not None:
-            yolox_boxes = nms(_rescale_boxes(yolox_boxes, scale), NMS_THRESHOLD)
-            groups.append(_ModelGroup("yolox", yolox_boxes, YOLOX_TRUST, YOLOX_MIN))
+            yolox = nms(_rescale_boxes(yolox_boxes, scale), NMS_THRESHOLD)
+            groups.append(_ModelGroup("yolox", yolox, YOLOX_TRUST, YOLOX_MIN))
+        return _fuse(groups)
 
-        accepted = _fuse(groups)
-        return accepted, second_boxes, yunet_boxes, yolox_boxes
+    def _output(
+        self, accepted: list[Box], width: int, height: int, work_scale: float
+    ) -> list[Box]:
+        if work_scale < 0.999:
+            accepted = _rescale_boxes(accepted, work_scale)
+        clamped = [box for box in (clamp_box(b, width, height) for b in accepted) if box]
+        return nms(clamped, NMS_THRESHOLD)
+
+    def _debug_result(
+        self,
+        faces: list[Box],
+        second_boxes: list[Box],
+        yunet_boxes: list[Box],
+        yolox_boxes: list[Box],
+        scale: float,
+        escalation_stage: int,
+        stage_timings: dict[str, float] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "faces": faces,
+            "centerface": nms(_rescale_boxes(second_boxes, scale), self.second.nms_threshold),
+            "yunet": nms(_rescale_boxes(yunet_boxes, scale), NMS_THRESHOLD),
+            "yolox": nms(_rescale_boxes(yolox_boxes, scale), NMS_THRESHOLD) if yolox_boxes else [],
+            "escalation_stage": escalation_stage,
+            "stage_timings_ms": stage_timings or {},
+        }
 
 
 def _fuse(groups: list[_ModelGroup]) -> list[Box]:
@@ -197,9 +255,6 @@ def _needs_low_light(image: np.ndarray) -> bool:
 
 
 def _enhance_low_light(image: np.ndarray) -> np.ndarray:
-    """Fast detection-only enhancement: CLAHE on luminance plus a shadow-lifting
-    gamma when the frame is dark. No bilateral filtering (too slow, and it
-    magnifies compression noise into false positives)."""
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     lightness, a_channel, b_channel = cv2.split(lab)
 
@@ -216,8 +271,6 @@ def _enhance_low_light(image: np.ndarray) -> np.ndarray:
 
 
 def _enhance_clahe(image: np.ndarray) -> np.ndarray:
-    """Single cheap contrast pass for noisy images that are not dark enough to
-    trigger the low-light path."""
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     lightness, a_channel, b_channel = cv2.split(lab)
     lightness = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(lightness)
