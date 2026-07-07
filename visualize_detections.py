@@ -8,9 +8,8 @@ see, per image:
   - RED thin boxes:      YuNet proposals (with score).
   - YELLOW thin boxes:   YOLOX-face proposals, if the model is present (with score).
 
-Where a green box sits on overlapping blue+red/yellow boxes, multiple models
-agreed. The summary also shows whether the image was classified as hard and
-whether the stricter zero-face recovery path had to run.
+Where a green box sits on overlapping blue+red boxes, the two models agreed.
+Green boxes with no overlap were accepted on a single model's confidence.
 Use this to spot misses (a face with no green box) and false positives (a green
 box on a non-face), then adjust the thresholds in ensemble_detector.py.
 
@@ -79,8 +78,7 @@ def main() -> int:
                 f"accepted={len(result['faces'])} "
                 f"centerface={len(result['centerface'])} yunet={len(result['yunet'])} "
                 f"yolox={len(result.get('yolox', []))} "
-                f"hard={'yes' if result.get('is_hard') else 'no'} "
-                f"recovery={'yes' if result.get('recovery_used') else 'no'}"
+                f"retry={'yes' if result.get('retry_used') else 'no'}"
             )
             print(line)
             summary.append(line)
