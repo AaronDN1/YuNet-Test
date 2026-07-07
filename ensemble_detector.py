@@ -13,10 +13,6 @@ model. A medium-confidence face seen by only one model is still recoverable
 through agreement rather than silently dropped, which matters for a privacy tool
 where a missed face is a leak. More independent voters make agreement stronger.
 
-Zero-face salvage: if fusion still accepts nothing after the CLAHE retry, one
-alternate-enhancement pass runs with a slightly lower CenterFace proposal
-threshold. Fusion trust rules stay unchanged.
-
 All bundled models are MIT/Apache-2.0 and safe for commercial use.
 """
 
@@ -43,15 +39,6 @@ YOLOX_TILE_ENABLED = False
 # Only spend a second detection pass on enhancement when the image needs it.
 LOW_LIGHT_MEAN = 110.0
 LOW_CONTRAST_STDDEV = 48.0
-
-# If the lean path still finds nothing, and the image was bright/flat enough that
-# we skipped the low-light pass, try one cheap CLAHE contrast boost. This targets
-# noisy JPEG-style misses without the heavy recovery path from before.
-ZERO_FACE_CLAHE_RETRY = True
-
-# Last resort on quarantine-bound images: alternate enhancement, lower CF proposals only.
-ZERO_FACE_SALVAGE_PASS = True
-SALVAGE_CENTERFACE_SCORE = 0.28
 
 # Per-model thresholds: accept alone above `trust`; below it (but above `min`)
 # only with corroboration from another model.
@@ -89,7 +76,7 @@ class EnsembleFaceDetector:
     def detect(self, image: np.ndarray) -> list[Box]:
         return self.detect_debug(image)["faces"]
 
-    def detect_debug(self, image: np.ndarray) -> dict[str, object]:
+    def detect_debug(self, image: np.ndarray) -> dict[str, list[Box]]:
         """Run detection and also return each model's raw boxes.
 
         The extra fields let the visualization tool show what each model proposed
@@ -123,58 +110,6 @@ class EnsembleFaceDetector:
             if self.yolox is not None and YOLOX_TILE_ENABLED:
                 yolox_boxes.extend(self.yolox.detect_tiles(work, rows=2, cols=2))
 
-        retry_used = False
-        salvage_used = False
-        accepted, second_boxes, yunet_boxes, yolox_boxes = self._finalize(
-            second_boxes, yunet_boxes, yolox_boxes, scale
-        )
-
-        # Noisy but adequately bright/flat images skip the low-light pass. If they
-        # would quarantine, one CLAHE retry is cheap and uses the same fusion rules.
-        if ZERO_FACE_CLAHE_RETRY and not accepted and len(views) == 1:
-            retry_used = True
-            clahe_view = _enhance_clahe(work)
-            second_boxes.extend(self.second.detect(clahe_view))
-            yunet_boxes.extend(self.yunet.detect_simple(clahe_view))
-            if self.yolox is not None:
-                yolox_boxes.extend(self.yolox.detect(clahe_view))
-            accepted, second_boxes, yunet_boxes, yolox_boxes = self._finalize(
-                second_boxes, yunet_boxes, yolox_boxes, scale
-            )
-
-        # Dark images already got low-light; bright images may have had CLAHE above.
-        # One alternate enhancement with lower CF proposals only on still-zero faces.
-        if ZERO_FACE_SALVAGE_PASS and not accepted:
-            salvage_used = True
-            salvage_view = _enhance_clahe(work) if len(views) > 1 else _enhance_low_light(work)
-            second_boxes.extend(
-                self.second.detect(salvage_view, score_threshold=SALVAGE_CENTERFACE_SCORE)
-            )
-            yunet_boxes.extend(self.yunet.detect_simple(salvage_view))
-            if self.yolox is not None:
-                yolox_boxes.extend(self.yolox.detect(salvage_view))
-            accepted, second_boxes, yunet_boxes, yolox_boxes = self._finalize(
-                second_boxes, yunet_boxes, yolox_boxes, scale
-            )
-
-        clamped = [box for box in (clamp_box(b, width, height) for b in accepted) if box]
-        faces = nms(clamped, NMS_THRESHOLD)
-        return {
-            "faces": faces,
-            "centerface": second_boxes,
-            "yunet": yunet_boxes,
-            "yolox": yolox_boxes,
-            "retry_used": retry_used,
-            "salvage_used": salvage_used,
-        }
-
-    def _finalize(
-        self,
-        second_boxes: list[Box],
-        yunet_boxes: list[Box],
-        yolox_boxes: list[Box],
-        scale: float,
-    ) -> tuple[list[Box], list[Box], list[Box], list[Box]]:
         second_boxes = nms(_rescale_boxes(second_boxes, scale), self.second.nms_threshold)
         yunet_boxes = nms(_rescale_boxes(yunet_boxes, scale), NMS_THRESHOLD)
 
@@ -187,7 +122,14 @@ class EnsembleFaceDetector:
             groups.append(_ModelGroup("yolox", yolox_boxes, YOLOX_TRUST, YOLOX_MIN))
 
         accepted = _fuse(groups)
-        return accepted, second_boxes, yunet_boxes, yolox_boxes
+        clamped = [box for box in (clamp_box(b, width, height) for b in accepted) if box]
+        faces = nms(clamped, NMS_THRESHOLD)
+        return {
+            "faces": faces,
+            "centerface": second_boxes,
+            "yunet": yunet_boxes,
+            "yolox": yolox_boxes,
+        }
 
 
 def _fuse(groups: list[_ModelGroup]) -> list[Box]:
@@ -238,15 +180,6 @@ def _enhance_low_light(image: np.ndarray) -> np.ndarray:
         enhanced = cv2.LUT(enhanced, lut)
 
     return enhanced
-
-
-def _enhance_clahe(image: np.ndarray) -> np.ndarray:
-    """Single cheap contrast pass for noisy images that are not dark enough to
-    trigger the low-light path."""
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    lightness, a_channel, b_channel = cv2.split(lab)
-    lightness = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(lightness)
-    return cv2.cvtColor(cv2.merge((lightness, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
 
 
 def _rescale_boxes(boxes: list[Box], coordinate_scale: float) -> list[Box]:

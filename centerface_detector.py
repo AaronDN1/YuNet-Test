@@ -50,8 +50,8 @@ class CenterFaceDetector:
         self.nms_threshold = nms_threshold
         self.input_size = max(32, int(round(input_size / 32) * 32))
 
-    def detect(self, image: np.ndarray, score_threshold: float | None = None) -> list[Box]:
-        return self._detect_scaled(image, 0, 0, score_threshold)
+    def detect(self, image: np.ndarray) -> list[Box]:
+        return self._detect_scaled(image, 0, 0)
 
     def detect_candidates(self, image: np.ndarray) -> list[Box]:
         height, width = image.shape[:2]
@@ -60,9 +60,7 @@ class CenterFaceDetector:
             boxes.extend(self.detect_tiles(image, rows=2, cols=2))
         return nms(boxes, self.nms_threshold)
 
-    def detect_tiles(
-        self, image: np.ndarray, rows: int, cols: int, score_threshold: float | None = None
-    ) -> list[Box]:
+    def detect_tiles(self, image: np.ndarray, rows: int, cols: int) -> list[Box]:
         height, width = image.shape[:2]
         tile_w = width / cols
         tile_h = height / rows
@@ -79,16 +77,10 @@ class CenterFaceDetector:
                 tile = image[y1:y2, x1:x2]
                 if tile.size == 0:
                     continue
-                boxes.extend(self._detect_scaled(tile, x1, y1, score_threshold))
+                boxes.extend(self._detect_scaled(tile, x1, y1))
         return boxes
 
-    def _detect_scaled(
-        self,
-        image: np.ndarray,
-        x_offset: int,
-        y_offset: int,
-        score_threshold: float | None = None,
-    ) -> list[Box]:
+    def _detect_scaled(self, image: np.ndarray, x_offset: int, y_offset: int) -> list[Box]:
         height, width = image.shape[:2]
         if width < 8 or height < 8:
             return []
@@ -106,17 +98,7 @@ class CenterFaceDetector:
         )
         self.net.setInput(blob)
         heatmap, scale, offset, _ = self.net.forward(list(OUTPUT_NAMES))
-        return self._decode(
-            heatmap,
-            scale,
-            offset,
-            ratio,
-            new_w,
-            new_h,
-            x_offset,
-            y_offset,
-            self.score_threshold if score_threshold is None else score_threshold,
-        )
+        return self._decode(heatmap, scale, offset, ratio, new_w, new_h, x_offset, y_offset)
 
     def _decode(
         self,
@@ -128,13 +110,12 @@ class CenterFaceDetector:
         content_h: int,
         x_offset: int,
         y_offset: int,
-        score_threshold: float,
     ) -> list[Box]:
         heat = heatmap[0, 0]
         scale_h_map, scale_w_map = scale[0, 0], scale[0, 1]
         offset_y_map, offset_x_map = offset[0, 0], offset[0, 1]
 
-        rows, cols = np.where(heat > score_threshold)
+        rows, cols = np.where(heat > self.score_threshold)
         if rows.size == 0:
             return []
 

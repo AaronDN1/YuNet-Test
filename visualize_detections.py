@@ -15,6 +15,8 @@ box on a non-face), then adjust the thresholds in ensemble_detector.py.
 
 Usage:
     python visualize_detections.py INPUT_DIR [OUTPUT_DIR]
+
+Wrap paths that contain spaces in quotes on Windows.
 """
 
 from __future__ import annotations
@@ -25,7 +27,12 @@ from pathlib import Path
 import cv2
 
 from image_io import iter_image_files, load_image
-from main import _find_second_model, _find_yolox_model, _find_yunet_model, build_ensemble_detector
+from main import (
+    _find_second_model,
+    _find_yolox_model,
+    _find_yunet_model,
+    build_ensemble_detector,
+)
 
 
 def _draw(image, boxes, color, thickness, label_scores):
@@ -44,21 +51,64 @@ def _draw(image, boxes, color, thickness, label_scores):
             )
 
 
+def _resolve_input_dir(argv: list[str]) -> Path:
+    """Resolve input folder, joining argv tokens when a spaced path was not quoted."""
+    if len(argv) == 2:
+        return Path(argv[1]).resolve()
+
+    if len(argv) == 3:
+        return Path(argv[1]).resolve()
+
+    joined = Path(" ".join(argv[1:]))
+    if joined.is_dir():
+        return joined.resolve()
+
+    joined_input = Path(" ".join(argv[1:-1]))
+    if joined_input.is_dir():
+        return joined_input.resolve()
+
+    return Path(argv[1]).resolve()
+
+
+def _resolve_output_dir(argv: list[str], input_dir: Path) -> Path:
+    if len(argv) == 3:
+        return Path(argv[2]).resolve()
+    if len(argv) > 3:
+        joined_input = Path(" ".join(argv[1:-1]))
+        if joined_input.is_dir():
+            return Path(argv[-1]).resolve()
+    return (input_dir.parent / f"{input_dir.name}_annotated").resolve()
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print(__doc__)
         return 2
 
-    input_dir = Path(sys.argv[1]).resolve()
-    output_dir = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else input_dir.parent / f"{input_dir.name}_annotated"
+    input_dir = _resolve_input_dir(sys.argv)
+    output_dir = _resolve_output_dir(sys.argv, input_dir)
+
+    if not input_dir.is_dir():
+        print(f"Input folder not found: {input_dir}")
+        print('If the path contains spaces, wrap it in quotes, for example:')
+        print('  python visualize_detections.py "C:\\path\\with spaces\\Quarantine"')
+        return 1
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     detector, note = build_ensemble_detector(
         _find_yunet_model(), _find_second_model(), _find_yolox_model()
     )
     print(note)
+    print(f"Input: {input_dir}")
     files = iter_image_files(input_dir, recursive=True)
     print(f"Annotating {len(files)} image(s) -> {output_dir}")
+
+    if not files:
+        print("No images found.")
+        print("Supported extensions: .jpg .jpeg .png .bmp .tif .tiff .webp")
+        print("Check that the folder path is correct and contains image files.")
+        return 1
 
     summary: list[str] = []
     for index, source in enumerate(files, start=1):
@@ -79,9 +129,7 @@ def main() -> int:
                 f"[{index}/{len(files)}] {source.name}: "
                 f"accepted={len(result['faces'])} "
                 f"centerface={len(result['centerface'])} yunet={len(result['yunet'])} "
-                f"yolox={len(result.get('yolox', []))} "
-                f"retry={'yes' if result.get('retry_used') else 'no'} "
-                f"salvage={'yes' if result.get('salvage_used') else 'no'}"
+                f"yolox={len(result.get('yolox', []))}"
             )
             print(line)
             summary.append(line)

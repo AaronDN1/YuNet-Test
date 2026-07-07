@@ -18,8 +18,6 @@ This is not a face recognition app. It does not identify, compare, label, classi
 - Lean, fixed detection passes tuned for batch/CPU speed: one capped-resolution
   pass per model, a low-light-enhanced pass only when the image is dark or flat,
   and a 2x2 tiled pass only on large images for small faces.
-- Zero-face salvage pass: if an image would quarantine, one alternate-enhancement
-  retry runs automatically (no extra user step).
 - Adaptive CLAHE + shadow-lifting gamma for low-light images (applied to both detectors).
 - IoU non-maximum suppression to merge duplicate detections.
 - Expanded anonymization boxes to cover forehead, chin, ears, and face edges.
@@ -131,8 +129,6 @@ precision/recall balance and speed:
 - `MAX_DETECTION_SIDE = 1600` — full-frame passes run at this cap. Lower is faster but misses small faces.
 - `TILE_TRIGGER_SIDE = 1600` — images at/above this also get a tiled pass.
 - `YOLOX_TILE_ENABLED = False` — enable to also tile YOLOX (better small-face recall, noticeably slower).
-- `ZERO_FACE_CLAHE_RETRY = True` — if the lean path finds nothing and the image skipped the low-light pass, run one cheap CLAHE retry with the same fusion rules.
-- `ZERO_FACE_SALVAGE_PASS = True` — if still zero faces, one alternate-enhancement pass with a lower CenterFace proposal threshold on salvage only (`SALVAGE_CENTERFACE_SCORE = 0.28`). Fusion trust rules stay unchanged.
 - `CENTERFACE_TRUST = 0.45` / `YUNET_TRUST = 0.85` / `YOLOX_TRUST = 0.50` — accept a detection from one model alone above these scores.
 - `CENTERFACE_MIN = 0.20` / `YUNET_MIN = 0.40` / `YOLOX_MIN = 0.30` — weaker detections need corroboration from another model.
 - `AGREEMENT_IOU = 0.30` / `AGREEMENT_CONTAINMENT = 0.60` — overlap needed to count as agreement.
@@ -150,4 +146,4 @@ python visualize_detections.py path/to/input_folder
 
 It writes annotated copies (green = accepted/blurred, blue = CenterFace, red = YuNet, with scores) plus a `_summary.txt`.
 
-Enhancements are detection-only; anonymization is still applied to the original-resolution image. Normal-image passes always run, while extra low-light, CLAHE retry, and salvage variants run only when needed.
+Enhancements are detection-only; anonymization is still applied to the original-resolution image. Normal-image passes always run, while extra low-light and restoration variants are selected from measured brightness, contrast, and sharpness.
