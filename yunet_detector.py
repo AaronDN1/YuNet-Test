@@ -8,6 +8,12 @@ import numpy as np
 
 from anonymizer import Box, clamp_box
 from boxops import containment, iou, nms
+from image_quality import (
+    LOW_CONTRAST_STDDEV,
+    LOW_LIGHT_MEAN,
+    SOFT_IMAGE_LAPLACIAN_VARIANCE,
+    build_hard_image_variants,
+)
 
 
 SCORE_THRESHOLD = 0.45
@@ -24,10 +30,6 @@ TILE_OVERLAP = 0.20
 ENHANCED_SCALES = (1.0, 1.5, 2.0)
 ENHANCEMENT_MAX_SIDE = 1800
 ENABLE_ROTATED_PASSES = True
-LOW_LIGHT_MEAN = 105.0
-LOW_CONTRAST_STDDEV = 42.0
-SOFT_IMAGE_LAPLACIAN_VARIANCE = 115.0
-
 
 @dataclass(frozen=True)
 class DetectionCandidate:
@@ -245,40 +247,7 @@ def bounded_copy(image: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
 
 def enhancement_variants(image: np.ndarray) -> list[np.ndarray]:
     """Build a small adaptive set of detection-only image enhancements."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    mean, stddev = cv2.meanStdDev(gray)
-    brightness = float(mean[0, 0])
-    contrast = float(stddev[0, 0])
-    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    variants: list[np.ndarray] = []
-
-    # Local luminance contrast is useful across normal, backlit, and unevenly
-    # illuminated scenes while preserving color information expected by YuNet.
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    lightness, a_channel, b_channel = cv2.split(lab)
-    clip_limit = 3.0 if contrast < LOW_CONTRAST_STDDEV else 2.0
-    lightness = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8)).apply(lightness)
-    variants.append(cv2.cvtColor(cv2.merge((lightness, a_channel, b_channel)), cv2.COLOR_LAB2BGR))
-
-    if brightness < LOW_LIGHT_MEAN:
-        # Gamma below one lifts shadow detail without flattening highlights.
-        gamma = float(np.clip(0.48 + brightness / 500.0, 0.48, 0.68))
-        lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
-        lifted = cv2.LUT(image, lut)
-        lifted_lab = cv2.cvtColor(lifted, cv2.COLOR_BGR2LAB)
-        lifted_l, lifted_a, lifted_b = cv2.split(lifted_lab)
-        lifted_l = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(lifted_l)
-        variants.append(cv2.cvtColor(cv2.merge((lifted_l, lifted_a, lifted_b)), cv2.COLOR_LAB2BGR))
-
-    if sharpness < SOFT_IMAGE_LAPLACIAN_VARIANCE or contrast < LOW_CONTRAST_STDDEV:
-        # Gentle denoising before unsharp masking avoids magnifying block and
-        # sensor noise in low-quality files.
-        denoised = cv2.bilateralFilter(image, 7, 35, 35)
-        smooth = cv2.GaussianBlur(denoised, (0, 0), 1.2)
-        restored = cv2.addWeighted(denoised, 1.65, smooth, -0.65, 0)
-        variants.append(restored)
-
-    return variants
+    return build_hard_image_variants(image)
 
 
 def _rescale_boxes(boxes: list[Box], coordinate_scale: float) -> list[Box]:

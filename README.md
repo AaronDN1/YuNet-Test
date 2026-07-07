@@ -16,9 +16,11 @@ This is not a face recognition app. It does not identify, compare, label, classi
   make agreement stronger.
 - Automatic fallback to YuNet-only if the CenterFace model is missing.
 - Lean, fixed detection passes tuned for batch/CPU speed: one capped-resolution
-  pass per model, a low-light-enhanced pass only when the image is dark or flat,
-  and a 2x2 tiled pass only on large images for small faces.
-- Adaptive CLAHE + shadow-lifting gamma for low-light images (applied to both detectors).
+  pass per model, a conditional hard-image path for dark/flat/soft images, and
+  a 2x2 tiled pass for small-face recovery.
+- Adaptive CLAHE, shadow-lifting gamma, and fast denoise+restore variants for
+  hard images, plus a stricter zero-face recovery stage that only runs when the
+  initial ensemble still finds nothing.
 - IoU non-maximum suppression to merge duplicate detections.
 - Expanded anonymization boxes to cover forehead, chin, ears, and face edges.
 - `visualize_detections.py` tool to inspect and tune detection on your own images.
@@ -115,13 +117,13 @@ YuNet pass settings are configurable in `yunet_detector.py`:
 - `ENHANCED_SCALES = (1.0, 1.5, 2.0)`
 - `ENABLE_ROTATED_PASSES = True`
 
-Detection runs a lean, fixed set of passes for speed: each model runs once on
-the resolution-capped frame, once more on a low-light-enhanced frame only when
-the image is dark or flat, and one 2x2 tiled pass only on large images to
-recover small faces. CenterFace settings are in `centerface_detector.py`
-(`SCORE_THRESHOLD`, `NMS_THRESHOLD`, `INPUT_SIZE`); it always runs at a fixed
-letterboxed input size for correctness across mixed-size batches. YOLOX settings
-are in `yolox_detector.py` (`SCORE_THRESHOLD`).
+Detection runs a lean default path for speed, then conditionally spends more
+work only on images that actually look hard. Hard images are classified from
+measured brightness, contrast, and Laplacian sharpness in `image_quality.py`.
+CenterFace settings are in `centerface_detector.py` (`SCORE_THRESHOLD`,
+`NMS_THRESHOLD`, `INPUT_SIZE`); it always runs at a fixed letterboxed input
+size for correctness across mixed-size batches. YOLOX settings are in
+`yolox_detector.py` (`SCORE_THRESHOLD`).
 
 The ensemble knobs live in `ensemble_detector.py` and are how you tune the
 precision/recall balance and speed:
@@ -129,9 +131,19 @@ precision/recall balance and speed:
 - `MAX_DETECTION_SIDE = 1600` — full-frame passes run at this cap. Lower is faster but misses small faces.
 - `TILE_TRIGGER_SIDE = 1600` — images at/above this also get a tiled pass.
 - `YOLOX_TILE_ENABLED = False` — enable to also tile YOLOX (better small-face recall, noticeably slower).
+- `RECOVERY_ENABLED = True` — if a hard image still has zero detections after the main ensemble, run a stricter recovery round.
+- `RECOVERY_UPSCALE = 2.0` — stronger upscale used only in zero-face recovery.
+- `RECOVERY_CENTERFACE_SCORE = 0.25` / `RECOVERY_YOLOX_SCORE = 0.22` — lower proposal thresholds used only during recovery.
 - `CENTERFACE_TRUST = 0.45` / `YUNET_TRUST = 0.85` / `YOLOX_TRUST = 0.50` — accept a detection from one model alone above these scores.
 - `CENTERFACE_MIN = 0.20` / `YUNET_MIN = 0.40` / `YOLOX_MIN = 0.30` — weaker detections need corroboration from another model.
 - `AGREEMENT_IOU = 0.30` / `AGREEMENT_CONTAINMENT = 0.60` — overlap needed to count as agreement.
+- `RECOVERY_AGREEMENT_IOU = 0.35` — slightly tighter overlap required during zero-face recovery, where solo-model accepts are disabled.
+
+Hard-image thresholds live in `image_quality.py`:
+
+- `LOW_LIGHT_MEAN = 105.0`
+- `LOW_CONTRAST_STDDEV = 42.0`
+- `SOFT_IMAGE_LAPLACIAN_VARIANCE = 115.0`
 
 To catch more faces (higher recall), lower the trust thresholds and agreement minimums. To cut false positives (higher precision), raise the trust thresholds so more detections must be corroborated by another model.
 
@@ -144,6 +156,6 @@ ensemble accepts, then adjust the knobs above:
 python visualize_detections.py path/to/input_folder
 ```
 
-It writes annotated copies (green = accepted/blurred, blue = CenterFace, red = YuNet, with scores) plus a `_summary.txt`.
+It writes annotated copies (green = accepted/blurred, blue = CenterFace, red = YuNet, yellow = YOLOX, with scores) plus a `_summary.txt`. Each summary line also shows `hard=yes/no` and `recovery=yes/no` so you can tell which images triggered the noisy/low-quality recovery path.
 
-Enhancements are detection-only; anonymization is still applied to the original-resolution image. Normal-image passes always run, while extra low-light and restoration variants are selected from measured brightness, contrast, and sharpness.
+Enhancements are detection-only; anonymization is still applied to the original-resolution image. Normal-image passes always run, while extra low-light and restoration variants are selected from measured brightness, contrast, and sharpness. Recovery never lowers the normal-image acceptance bar: it only runs when a hard image would otherwise be quarantined, and it requires cross-model agreement rather than solo confidence.

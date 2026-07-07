@@ -33,7 +33,7 @@ class YoloxFaceDetector:
         self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
 
-    def detect(self, image: np.ndarray) -> list[Box]:
+    def detect(self, image: np.ndarray, score_threshold: float | None = None) -> list[Box]:
         blob, ratio = self._preprocess(image)
         num_dets, boxes, scores, _classes = self.session.run(None, {self.input_name: blob})
 
@@ -43,9 +43,10 @@ class YoloxFaceDetector:
 
         results: list[Box] = []
         img_h, img_w = image.shape[:2]
+        threshold = self.score_threshold if score_threshold is None else score_threshold
         for index in range(count):
             score = float(scores[0, index])
-            if score < self.score_threshold:
+            if score < threshold:
                 continue
             x1, y1, x2, y2 = boxes[0, index]
             x1, y1, x2, y2 = x1 / ratio, y1 / ratio, x2 / ratio, y2 / ratio
@@ -57,7 +58,9 @@ class YoloxFaceDetector:
                 results.append(Box(x, y, w, h, score))
         return results
 
-    def detect_tiles(self, image: np.ndarray, rows: int, cols: int) -> list[Box]:
+    def detect_tiles(
+        self, image: np.ndarray, rows: int, cols: int, score_threshold: float | None = None
+    ) -> list[Box]:
         height, width = image.shape[:2]
         tile_h, tile_w = height // rows, width // cols
         overlap_y, overlap_x = tile_h // 5, tile_w // 5
@@ -72,7 +75,7 @@ class YoloxFaceDetector:
                 tile = image[y0:y1, x0:x1]
                 if tile.size == 0:
                     continue
-                for box in self.detect(tile):
+                for box in self.detect(tile, score_threshold=score_threshold):
                     results.append(Box(box.x + x0, box.y + y0, box.w, box.h, box.score))
         return results
 
