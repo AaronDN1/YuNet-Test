@@ -179,10 +179,11 @@ class FaceAnonymizerApp:
             self.events.put(("total", len(files)))
             log = ProcessingLog(config.output_dir, config.input_dir)
             detector, detector_note = _build_detector(config)
+            log.configure(len(files), config.mode, detector_note)
             self.events.put(("note", detector_note))
 
             for index, source in enumerate(files, start=1):
-                self.events.put(("file", f"[{index}/{len(files)}] {source}"))
+                self.events.put(("file", f"[{index}/{len(files)}] {source.name}"))
                 try:
                     relative = source.relative_to(config.input_dir)
                     image = load_image(source)
@@ -196,9 +197,8 @@ class FaceAnonymizerApp:
                     self.events.put(("success", (len(boxes), quarantined)))
                 except Exception as exc:
                     log.record_failure(source, f"{exc}\n{traceback.format_exc()}")
-                    self.events.put(("failure", f"{source}: {exc}"))
+                    self.events.put(("failure", f"{source.name}: {exc}"))
 
-            self.events.put(("finished_processing", log))
             self.events.put(("delete_check", (config, log)))
         except Exception as exc:
             self.events.put(("fatal", f"{exc}\n{traceback.format_exc()}"))
@@ -219,33 +219,31 @@ class FaceAnonymizerApp:
             self.failed = 0
             self.quarantined = 0
             self.progress.configure(value=0, maximum=max(1, self.total_files))
-            self._append_log(f"Found {self.total_files} image file(s).")
+            self.status_text.set(f"Found {self.total_files} image file(s).")
         elif event == "file":
             self.status_text.set(str(payload))
-            self._append_log(str(payload))
         elif event == "note":
-            self._append_log(str(payload))
+            self.status_text.set(str(payload))
         elif event == "success":
             faces, quarantined = payload  # type: ignore[misc]
             self.processed += 1
             if quarantined:
                 self.quarantined += 1
-                self._append_log("No face detected after all passes; isolated in Quarantine.")
             self.progress.configure(value=self.processed + self.failed)
             self.status_text.set(
-                f"Processed: {self.processed} | Quarantined: {self.quarantined} | "
+                f"Processed: {self.processed}/{self.total_files} | Quarantined: {self.quarantined} | "
                 f"Failed: {self.failed} | Faces in last file: {faces}"
             )
         elif event == "failure":
             self.failed += 1
             self.progress.configure(value=self.processed + self.failed)
-            self._append_log(f"FAILED: {payload}")
-            self.status_text.set(f"Processed: {self.processed} | Failed: {self.failed}")
+            self.status_text.set(
+                f"Processed: {self.processed}/{self.total_files} | Quarantined: {self.quarantined} | "
+                f"Failed: {self.failed}"
+            )
         elif event == "delete_check":
             config, log = payload  # type: ignore[misc]
             self._maybe_delete(config, log)
-        elif event == "finished_processing":
-            self._append_log("Processing completed. Checking deletion settings...")
         elif event == "fatal":
             self.start_button.configure(state="normal")
             messagebox.showerror("Processing failed", str(payload))
@@ -264,20 +262,21 @@ class FaceAnonymizerApp:
             if confirmed:
                 ok, message = delete_input_folder(config.input_dir)
                 deletion_performed = ok
-                self._append_log(message)
                 if not ok:
                     messagebox.showerror("Deletion failed", message)
 
-        log.finish(deletion_performed)
+        report_text = log.finish(deletion_performed)
+        self._clear_log()
+        self._append_log(report_text.rstrip())
         self.start_button.configure(state="normal")
         self.status_text.set(
-            f"Complete. Processed: {self.processed} | Quarantined: {self.quarantined} | "
-            f"Failed: {self.failed} | Log: {log.path}"
+            f"Complete. Anonymized: {self.processed - self.quarantined} | Quarantined: {self.quarantined} | "
+            f"Failed: {self.failed} | Report: {log.path}"
         )
         messagebox.showinfo(
             "Complete",
-            f"Processed {self.processed} file(s), quarantined {self.quarantined}, "
-            f"failed {self.failed}.\n\nLog:\n{log.path}",
+            f"Anonymized {self.processed - self.quarantined}, quarantined {self.quarantined}, "
+            f"failed {self.failed}.\n\nReport:\n{log.path}",
         )
 
     def _append_log(self, text: str) -> None:

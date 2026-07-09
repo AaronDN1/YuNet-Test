@@ -10,6 +10,7 @@ smoke_result.txt
 probe_result.txt
 Quarantine/
 face_anonymization_log_*.txt
+face_anonymization_report_*.txt
 
 # Model weights: ignore by default. Never commit non-commercial weights
 # (e.g. InsightFace SCRFD/RetinaFace det_10g.onnx / buffalo_*).
