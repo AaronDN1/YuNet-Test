@@ -3,16 +3,15 @@
 Design goals: fast and accurate on batch/CPU.
 
 Stage 1 (recall): each detector (YuNet, CenterFace, and optionally YOLOX-face)
-runs a small, fixed number of passes -- a base pass, one quality-triggered
-enhanced pass only when the image is dark/flat/soft, and one tiled pass only on
-large images for small faces. Everything runs at a single capped resolution,
-computed once.
+runs a small, fixed number of passes -- a base pass, one low-light-enhanced pass
+only when the image is dark/flat, and one tiled pass only on large images for
+small faces. Everything runs at a single capped resolution, computed once.
 
 Stage 2 (precision): cross-model agreement. A detection is kept if it is
 confident on its own OR corroborated by another architecturally independent
-model. Widened solo bands for YOLOX and YuNet are gated by face-like geometry
-and (for medium YOLOX) soft-image / multi-view consistency so noisy clinical
-misses can be recovered without a blanket threshold cut.
+model. Narrow mid-bands for YOLOX and YuNet can solo-accept with a face-like
+geometry check so a few noisy misses are recoverable without a second full
+detector pass or a blanket threshold cut.
 
 All bundled models are MIT/Apache-2.0 and safe for commercial use.
 """
@@ -40,20 +39,22 @@ YOLOX_TILE_ENABLED = False
 # Only spend a second detection pass on enhancement when the image needs it.
 LOW_LIGHT_MEAN = 110.0
 LOW_CONTRAST_STDDEV = 48.0
-SOFT_IMAGE_LAPLACIAN_VARIANCE = 115.0
 
 # Per-model thresholds: accept alone above `trust`; below it (but above `min`)
 # only with corroboration from another model.
 CENTERFACE_TRUST, CENTERFACE_MIN = 0.45, 0.20
-# YuNet: >= high_trust unconditional; [trust, high_trust) needs face-like geometry.
-YUNET_TRUST, YUNET_HIGH_TRUST, YUNET_MIN = 0.65, 0.85, 0.40
-# YOLOX: >= trust solo; [medium_min, trust) needs soft/multi-view + geometry.
-YOLOX_TRUST, YOLOX_MEDIUM_MIN, YOLOX_MIN = 0.45, 0.35, 0.30
+YUNET_TRUST, YUNET_MIN = 0.85, 0.40
+YOLOX_TRUST, YOLOX_MIN = 0.50, 0.30
+
+# Mid-band solo: below trust, above this floor, only with face-like geometry.
+# Covers yellow-only ~0.45-0.50 and red-only ~0.65 without opening the noisy
+# 0.35 band that produced false positives.
+YUNET_GATED_SOLO_MIN = 0.65
+YOLOX_GATED_SOLO_MIN = 0.45
 
 AGREEMENT_IOU = 0.30
 AGREEMENT_CONTAINMENT = 0.60
 
-# Geometry gate for widened solo paths (not applied to high-trust / agreement).
 FACE_ASPECT_MIN = 0.55
 FACE_ASPECT_MAX = 1.85
 FACE_MIN_SIDE_FRAC = 0.02
@@ -66,28 +67,7 @@ class _ModelGroup:
     boxes: list[Box]
     trust: float
     min_agree: float
-    high_trust: float | None = None
-    medium_min: float | None = None
-
-
-@dataclass(frozen=True)
-class _ImageQuality:
-    needs_low_light: bool
-    is_soft: bool
-
-    @property
-    def degraded(self) -> bool:
-        """True when an extra enhancement pass is justified or medium YOLOX may fire."""
-        return self.needs_low_light or self.is_soft
-
-
-@dataclass
-class _FuseContext:
-    image_width: int
-    image_height: int
-    degraded: bool
-    yolox_base: list[Box]
-    yolox_enhanced: list[Box]
+    gated_solo_min: float | None = None
 
 
 class EnsembleFaceDetector:
@@ -120,46 +100,30 @@ class EnsembleFaceDetector:
         # Cap resolution once; run every pass in this space, map back at the end.
         work, scale = bounded_copy(image, MAX_DETECTION_SIDE)
         large = max(work.shape[:2]) >= TILE_TRIGGER_SIDE
-        quality = _probe_quality(work)
 
         views = [work]
-        if quality.needs_low_light:
+        if _needs_low_light(work):
             views.append(_enhance_low_light(work))
-        elif quality.is_soft:
-            views.append(_enhance_soft(work))
 
         second_boxes: list[Box] = []
         yunet_boxes: list[Box] = []
-        yolox_base: list[Box] = []
-        yolox_enhanced: list[Box] = []
-        for view_index, view in enumerate(views):
+        yolox_boxes: list[Box] = []
+        for view in views:
             second_boxes.extend(self.second.detect(view))
             yunet_boxes.extend(self.yunet.detect_simple(view))
             if self.yolox is not None:
-                detected = self.yolox.detect(view)
-                if view_index == 0:
-                    yolox_base.extend(detected)
-                else:
-                    yolox_enhanced.extend(detected)
+                yolox_boxes.extend(self.yolox.detect(view))
 
         # Large images: one tiled pass recovers small faces missed when the whole
-        # frame is downscaled. Tiled YOLOX stays on the base view only.
+        # frame is downscaled.
         if large:
             second_boxes.extend(self.second.detect_tiles(work, rows=2, cols=2))
             yunet_boxes.extend(self.yunet.detect_tiles(work, rows=2, cols=2))
             if self.yolox is not None and YOLOX_TILE_ENABLED:
-                yolox_base.extend(self.yolox.detect_tiles(work, rows=2, cols=2))
+                yolox_boxes.extend(self.yolox.detect_tiles(work, rows=2, cols=2))
 
         second_boxes = nms(_rescale_boxes(second_boxes, scale), self.second.nms_threshold)
         yunet_boxes = nms(_rescale_boxes(yunet_boxes, scale), NMS_THRESHOLD)
-
-        yolox_boxes: list[Box] = []
-        yolox_base_rescaled: list[Box] = []
-        yolox_enhanced_rescaled: list[Box] = []
-        if self.yolox is not None:
-            yolox_base_rescaled = _rescale_boxes(yolox_base, scale)
-            yolox_enhanced_rescaled = _rescale_boxes(yolox_enhanced, scale)
-            yolox_boxes = nms(yolox_base_rescaled + yolox_enhanced_rescaled, NMS_THRESHOLD)
 
         groups = [
             _ModelGroup("centerface", second_boxes, CENTERFACE_TRUST, CENTERFACE_MIN),
@@ -168,28 +132,22 @@ class EnsembleFaceDetector:
                 yunet_boxes,
                 YUNET_TRUST,
                 YUNET_MIN,
-                high_trust=YUNET_HIGH_TRUST,
+                gated_solo_min=YUNET_GATED_SOLO_MIN,
             ),
         ]
         if self.yolox is not None:
+            yolox_boxes = nms(_rescale_boxes(yolox_boxes, scale), NMS_THRESHOLD)
             groups.append(
                 _ModelGroup(
                     "yolox",
                     yolox_boxes,
                     YOLOX_TRUST,
                     YOLOX_MIN,
-                    medium_min=YOLOX_MEDIUM_MIN,
+                    gated_solo_min=YOLOX_GATED_SOLO_MIN,
                 )
             )
 
-        context = _FuseContext(
-            image_width=width,
-            image_height=height,
-            degraded=quality.degraded,
-            yolox_base=yolox_base_rescaled,
-            yolox_enhanced=yolox_enhanced_rescaled,
-        )
-        accepted = _fuse(groups, context)
+        accepted = _fuse(groups, width, height)
         clamped = [box for box in (clamp_box(b, width, height) for b in accepted) if box]
         faces = nms(clamped, NMS_THRESHOLD)
         return {
@@ -200,62 +158,22 @@ class EnsembleFaceDetector:
         }
 
 
-def _fuse(groups: list[_ModelGroup], context: _FuseContext) -> list[Box]:
+def _fuse(groups: list[_ModelGroup], image_width: int, image_height: int) -> list[Box]:
     accepted: list[Box] = []
     for index, group in enumerate(groups):
         others = [g for j, g in enumerate(groups) if j != index]
         for box in group.boxes:
-            if _accept_box(box, group, others, context):
+            if box.score >= group.trust:
+                accepted.append(box)
+            elif (
+                group.gated_solo_min is not None
+                and box.score >= group.gated_solo_min
+                and _looks_like_face(box, image_width, image_height)
+            ):
+                accepted.append(box)
+            elif box.score >= group.min_agree and _corroborated_by_any(box, others):
                 accepted.append(box)
     return accepted
-
-
-def _accept_box(
-    box: Box,
-    group: _ModelGroup,
-    others: list[_ModelGroup],
-    context: _FuseContext,
-) -> bool:
-    high_trust = group.high_trust if group.high_trust is not None else group.trust
-
-    # Unconditional high-confidence solo (YuNet >= 0.85, or models without a mid band).
-    if box.score >= high_trust:
-        return True
-
-    # Mid-band solo: YuNet [0.65, 0.85) needs face-like geometry.
-    # If geometry fails, still allow cross-model agreement below.
-    if (
-        group.high_trust is not None
-        and box.score >= group.trust
-        and _looks_like_face(box, context.image_width, context.image_height)
-    ):
-        return True
-
-    # Cross-model agreement (unchanged).
-    if box.score >= group.min_agree and _corroborated_by_any(box, others):
-        return True
-
-    # Medium YOLOX solo: [0.35, 0.45) on soft/noisy images or multi-view consistent.
-    if (
-        group.medium_min is not None
-        and box.score >= group.medium_min
-        and box.score < group.trust
-        and _looks_like_face(box, context.image_width, context.image_height)
-        and (context.degraded or _yolox_multiview_consistent(box, context))
-    ):
-        return True
-
-    return False
-
-
-def _yolox_multiview_consistent(box: Box, context: _FuseContext) -> bool:
-    """True when the same region appears in both base and enhanced YOLOX passes."""
-    if not context.yolox_base or not context.yolox_enhanced:
-        return False
-    # Box is from the fused YOLOX list; require overlap with the *other* view.
-    in_base = _corroborated(box, context.yolox_base, YOLOX_MEDIUM_MIN)
-    in_enhanced = _corroborated(box, context.yolox_enhanced, YOLOX_MEDIUM_MIN)
-    return in_base and in_enhanced
 
 
 def _corroborated_by_any(box: Box, others: list[_ModelGroup]) -> bool:
@@ -272,7 +190,7 @@ def _corroborated(box: Box, others: list[Box], min_score: float) -> bool:
 
 
 def _looks_like_face(box: Box, image_width: int, image_height: int) -> bool:
-    """Reject obvious non-face blobs on widened solo paths only."""
+    """Reject obvious non-face blobs on gated mid-band solo paths only."""
     if box.w <= 0 or box.h <= 0 or image_width <= 0 or image_height <= 0:
         return False
 
@@ -290,19 +208,10 @@ def _looks_like_face(box: Box, image_width: int, image_height: int) -> bool:
     return True
 
 
-def _probe_quality(image: np.ndarray) -> _ImageQuality:
+def _needs_low_light(image: np.ndarray) -> bool:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     mean, stddev = cv2.meanStdDev(gray)
-    brightness = float(mean[0, 0])
-    contrast = float(stddev[0, 0])
-    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    needs_low_light = brightness < LOW_LIGHT_MEAN or contrast < LOW_CONTRAST_STDDEV
-    is_soft = sharpness < SOFT_IMAGE_LAPLACIAN_VARIANCE
-    return _ImageQuality(needs_low_light=needs_low_light, is_soft=is_soft)
-
-
-def _needs_low_light(image: np.ndarray) -> bool:
-    return _probe_quality(image).needs_low_light
+    return float(mean[0, 0]) < LOW_LIGHT_MEAN or float(stddev[0, 0]) < LOW_CONTRAST_STDDEV
 
 
 def _enhance_low_light(image: np.ndarray) -> np.ndarray:
@@ -322,15 +231,6 @@ def _enhance_low_light(image: np.ndarray) -> np.ndarray:
         enhanced = cv2.LUT(enhanced, lut)
 
     return enhanced
-
-
-def _enhance_soft(image: np.ndarray) -> np.ndarray:
-    """Cheap soft/noisy pass: mild Gaussian then CLAHE (no bilateral)."""
-    smoothed = cv2.GaussianBlur(image, (0, 0), 1.0)
-    lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
-    lightness, a_channel, b_channel = cv2.split(lab)
-    lightness = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(lightness)
-    return cv2.cvtColor(cv2.merge((lightness, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
 
 
 def _rescale_boxes(boxes: list[Box], coordinate_scale: float) -> list[Box]:
